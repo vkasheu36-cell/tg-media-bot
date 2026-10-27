@@ -45,9 +45,11 @@ from downloader import (
     SEMAPHORE,
     DownloadError,
     Track,
+    YOUTUBE_DISABLED,
     download_audio,
     download_media,
     is_music_link,
+    is_youtube,
     resolve_music_link,
     search,
 )
@@ -185,6 +187,23 @@ async def on_inline(query: InlineQuery) -> None:
 
 
 async def _answer_url(query: InlineQuery, url: str, username: str) -> None:
+    if is_youtube(url):
+        await query.answer(
+            [
+                InlineQueryResultArticle(
+                    id="youtube-disabled",
+                    title="YouTube не поддерживается",
+                    description="С серверного IP он требует вход — пришлите другую ссылку",
+                    input_message_content=InputTextMessageContent(
+                        message_text=YOUTUBE_DISABLED
+                    ),
+                )
+            ],
+            cache_time=0,
+            is_personal=True,
+        )
+        return
+
     results: list = []
 
     for mode, title, description in (

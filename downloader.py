@@ -7,6 +7,8 @@ import http.cookiejar
 import json
 import logging
 import re
+import shutil
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -64,6 +66,28 @@ _HITMO_ITEM_RE = re.compile(r"data-musmeta='(\{.*?\})'", re.S)
 _HITMO_TIME_RE = re.compile(r'track__fulltime">\s*(\d+):(\d{2})')
 _HITMO_SONG_RE = re.compile(r"hitmoz\.org/song/(\d+)")
 _HITMO_MP3_RE = re.compile(r"\.mp3(?:$|\?)", re.I)
+
+# Zvyki (zvyki.com): второй русский источник. Отдаёт AAC с прямыми ссылками
+# в атрибуте data-mp3, поэтому тоже обходится без yt-dlp.
+ZVYKI_BASE = "https://zvyki.com"
+ZVYKI_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+}
+_ZV_TRACK_RE = re.compile(r'<li class="track"(.*?)</li>', re.S)
+_ZV_MP3_RE = re.compile(r'data-mp3="([^"]+)"')
+_ZV_ID_RE = re.compile(r'data-id="(\d+)"')
+_ZV_DUR_RE = re.compile(r'data-duration="(\d+)"')
+_ZV_ARTIST_RE = re.compile(r'<span class="cartist">(.*?)</span>', re.S)
+_ZV_TITLE_RE = re.compile(r'<span class="ctitle">(.*?)</span>', re.S)
+_ZV_SONG_ID_RE = re.compile(r"zvyki\.com/song/(\d+)")
 
 
 class DownloadError(Exception):
@@ -127,6 +151,7 @@ _SERVICES = {
     "vimeo.com": "Vimeo",
     "soundcloud.com": "SoundCloud",
     "hitmoz.org": "Hitmo",
+    "zvyki.com": "Zvyki",
     "deliciousoranges.com": "Hitmo",
     "spotify.com": "Spotify",
     "music.apple.com": "Apple Music",
@@ -219,7 +244,8 @@ def friendly_error(exc: Exception, url: str | None = None) -> str:
     if "sign in to confirm" in low or "not a bot" in low:
         return (
             f"{prefix}не пускает сервер без входа.\n"
-            "Нужны cookies аккаунта — YT_COOKIES (README, раздел 2)."
+            "Если это YouTube — он ботом не поддерживается. Для Instagram/TikTok\n"
+            "помогают cookies аккаунта: COOKIES_FILE или YT_COOKIES."
         )
     if "too many requests" in low or "http error 429" in low or "rate limit" in low:
         return f"{prefix}ограничил запросы.\nПодождите пару минут."
@@ -367,7 +393,7 @@ async def resolve_music_link(url: str) -> str | None:
 
 
 def _search_sync(query: str, provider: str, limit: int) -> list[Track]:
-    prefix = "ytsearch" if provider == "yt" else "scsearch"
+    prefix = "scsearch"
     opts = _opts() | {"extract_flat": "in_playlist", "skip_download": True}
 
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -390,12 +416,8 @@ def _search_sync(query: str, provider: str, limit: int) -> list[Track]:
         if duration and not (20 <= duration <= 20 * 60):
             continue
 
-        if provider == "yt":
-            video_id = str(entry.get("id") or "")
-            url = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
-        else:
-            url = (entry.get("webpage_url") or entry.get("url") or "").strip()
-            video_id = str(entry.get("id") or url)
+        url = (entry.get("webpage_url") or entry.get("url") or "").strip()
+        video_id = str(entry.get("id") or url)
 
         if not url.startswith("http"):
             continue
@@ -417,9 +439,12 @@ async def _search_one(query: str, provider: str, limit: int) -> list[Track]:
     try:
         if provider == "hm":
             return await asyncio.to_thread(_hitmo_search_sync, query, limit)
-        timeout = 20.0 if provider == "yt" else 25.0
+        if provider == "zv":
+            return await asyncio.wait_for(
+                asyncio.to_thread(_zvyki_search_sync, query, limit), timeout=15.0
+            )
         return await asyncio.wait_for(
-            asyncio.to_thread(_search_sync, query, provider, limit), timeout=timeout
+            asyncio.to_thread(_search_sync, query, provider, limit), timeout=25.0
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s search failed for %r: %s", provider, query, exc)
@@ -612,8 +637,236 @@ def _hitmo_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Pat
     return _hitmo_download_sync(track, out_dir, on_progress)
 
 
+# ---------------------------------------------------------------- Zvyki
+
+
+def _zvyki_get(url: str, timeout: float = 30.0) -> str:
+    """Страница zvyki.com обычным GET: сайт не требует cookies, только Referer."""
+    # в ссылке из чата могут остаться кириллица и пробелы — urllib такое не умеет
+    url = urllib.parse.quote(url, safe=":/?&=%(),._-~+#")
+    last: Exception | None = None
+    for _ in range(2):
+        request = urllib.request.Request(
+            url, headers={**ZVYKI_HEADERS, "Referer": ZVYKI_BASE + "/"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read().decode("utf-8", "replace")
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+    raise last if last else DownloadError("Zvyki недоступен.")
+
+
+def _is_zvyki(url: str) -> bool:
+    host = (urlsplit(url).netloc or "").lower()
+    return host.endswith("zvyki.com")
+
+
+def _zvyki_parse_tracks(body: str, limit: int) -> list[Track]:
+    """Треки лежат в <li class="track" data-id data-mp3 data-duration>."""
+    tracks: list[Track] = []
+    for block in _ZV_TRACK_RE.finditer(body):
+        chunk = block.group(1)
+        mp3 = _ZV_MP3_RE.search(chunk)
+        track_id = _ZV_ID_RE.search(chunk)
+        if not mp3 or not track_id:
+            continue
+
+        artist_match = _ZV_ARTIST_RE.search(chunk)
+        title_match = _ZV_TITLE_RE.search(chunk)
+        artist = html.unescape(artist_match.group(1)).strip() if artist_match else ""
+        title = html.unescape(title_match.group(1)).strip() if title_match else ""
+        if not title:
+            continue
+
+        duration = 0
+        dur_match = _ZV_DUR_RE.search(chunk)
+        if dur_match:
+            duration = int(dur_match.group(1)) // 1000
+
+        tracks.append(
+            Track(
+                provider="zv",
+                video_id=track_id.group(1),
+                url=html.unescape(mp3.group(1)),
+                title=title,
+                uploader=artist,
+                duration=duration,
+            )
+        )
+        if len(tracks) >= limit:
+            break
+    return tracks
+
+
+def _zvyki_search_sync(query: str, limit: int) -> list[Track]:
+    page = f"{ZVYKI_BASE}/search/q/{urllib.parse.quote_plus(query)}/"
+    return _zvyki_parse_tracks(_zvyki_get(page, timeout=20), limit)
+
+
+def _zvyki_song_track_sync(url: str) -> Track:
+    """Страница трека: берём блок с нужным data-id."""
+    body = _zvyki_get(url)
+    song_match = _ZV_SONG_ID_RE.search(url)
+    song_id = song_match.group(1) if song_match else ""
+
+    if song_id:
+        pattern = re.compile(
+            r'<li class="track"[^>]*data-id="' + re.escape(song_id) + r'".*?</li>', re.S
+        )
+        found = pattern.search(body)
+        if found:
+            parsed = _zvyki_parse_tracks(found.group(0), 1)
+            if parsed:
+                return parsed[0]
+
+    parsed = _zvyki_parse_tracks(body, 1)
+    if parsed:
+        return parsed[0]
+    raise DownloadError("Zvyki: не удалось разобрать страницу трека.")
+
+
+def _zvyki_fetch_file(url: str, dest: Path, on_progress=None) -> int:
+    safe = urllib.parse.quote(url, safe=":/?&=%(),._-~+")
+    request = urllib.request.Request(
+        safe, headers={**ZVYKI_HEADERS, "Referer": ZVYKI_BASE + "/"}
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        total = response.headers.get("Content-Length")
+        total = int(total) if total and total.isdigit() else None
+        done = 0
+        with dest.open("wb") as fh:
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                done += len(chunk)
+                if on_progress:
+                    on_progress(done, total)
+    return done
+
+
+def _to_m4a(src: Path, dest: Path, title: str, artist: str) -> bool:
+    """Zvyki отдаёт голый AAC — упаковываем в m4a без перекодирования (быстро)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    cmd = [
+        ffmpeg, "-y", "-loglevel", "error", "-i", str(src),
+        "-c", "copy",
+        "-metadata", f"title={title}",
+        "-metadata", f"artist={artist}",
+        str(dest),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0 or not dest.exists() or dest.stat().st_size < 10_000:
+        log.warning("Zvyki: ffmpeg не упаковал файл: %s", result.stderr[-300:])
+        return False
+    return True
+
+
+def _sniff_audio(head: bytes) -> str:
+    """Каким форматом реально отдал файл сервер: 'mp3', 'aac' или пусто."""
+    if head[:3] == b"ID3":
+        return "mp3"
+    if len(head) >= 2 and head[0] == 0xFF:
+        # ADTS (AAC): syncword + layer == 00
+        if (head[1] & 0xF6) == 0xF0:
+            return "aac"
+        # MPEG audio (mp3): syncword + layer != 00
+        if (head[1] & 0xE0) == 0xE0 and (head[1] & 0x06) != 0:
+            return "mp3"
+    return ""
+
+
+def _zvyki_download_sync(
+    track: Track, out_dir: Path, on_progress=None
+) -> tuple[Path, dict]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if track.uploader:
+        name = _safe_track_name(f"{track.uploader} - {track.title}")
+    else:
+        name = _safe_track_name(track.title)
+
+    # Zvyki отдаёт то mp3, то голый AAC — определяем по первым байтам
+    raw = out_dir / f"{name}.tmp"
+    size = _zvyki_fetch_file(track.url, raw, on_progress)
+    if size < 20_000:
+        raw.unlink(missing_ok=True)
+        raise DownloadError("Zvyki отдал пустой файл. Попробуйте другой трек.")
+    if size > MAX_UPLOAD_MB * 1024 * 1024:
+        raw.unlink(missing_ok=True)
+        raise DownloadError(f"Файл больше {MAX_UPLOAD_MB} МБ — Telegram не примет.")
+
+    with raw.open("rb") as fh:
+        kind = _sniff_audio(fh.read(4))
+
+    if kind == "mp3":
+        path = out_dir / f"{name}.mp3"
+        raw.replace(path)
+    else:
+        m4a = out_dir / f"{name}.m4a"
+        if _to_m4a(raw, m4a, track.title, track.uploader):
+            raw.unlink(missing_ok=True)
+            path = m4a
+        else:
+            # без ffmpeg отдадим как документ, но трек не потеряем
+            path = out_dir / f"{name}.aac"
+            raw.replace(path)
+
+    return path, {
+        "title": track.title,
+        "track": track.title,
+        "artist": track.uploader,
+        "uploader": track.uploader,
+        "duration": track.duration,
+    }
+
+
+def _zvyki_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, dict]:
+    """Ссылка на Zvyki из чата: страница трека или прямой файл data.zvyki.com."""
+    if (urlsplit(url).netloc or "").lower().startswith("data."):
+        stem = urllib.parse.unquote(urlsplit(url).path.rsplit("/", 1)[-1])
+        title = re.sub(r"\.(?:mp3|aac|m4a)$", "", stem, flags=re.I)
+        title = title.replace("(Zvyki.com)", "").replace("_", " ").strip() or "Zvyki"
+        artist = ""
+        if " - " in title:
+            artist, _, title = title.partition(" - ")
+        track = Track(
+            provider="zv",
+            video_id=url,
+            url=url,
+            title=title.strip() or "Zvyki",
+            uploader=artist.strip(),
+            duration=0,
+        )
+    else:
+        track = _zvyki_song_track_sync(url)
+    return _zvyki_download_sync(track, out_dir, on_progress)
+
+
+def is_youtube(url: str) -> bool:
+    """YouTube убран из бота: с серверных IP он отдаёт «подтвердите вход»."""
+    host = (urlsplit(url).netloc or "").lower()
+    return (
+        host.endswith("youtube.com")
+        or host.endswith("youtu.be")
+        or host.endswith("youtube-nocookie.com")
+    )
+
+
+YOUTUBE_DISABLED = (
+    "YouTube больше не скачивается: с серверного IP он требует вход.\n"
+    "Пришлите ссылку на другой сервис или название трека — найду в музыке."
+)
+
+
 async def search(query: str, limit: int = 12, budget: float | None = None) -> list[Track]:
-    """Ищет треки: Hitmo — приоритетный источник, затем YouTube и SoundCloud.
+    """Ищет треки: Hitmo и Zvyki (готовые файлы), затем SoundCloud.
 
     ``budget`` — сколько секунд ждать (для inline-режима). Если Hitmo уже дал
     достаточно результатов, медленные источники не трогаем вовсе.
@@ -632,7 +885,7 @@ async def search(query: str, limit: int = 12, budget: float | None = None) -> li
         needed = max(4, limit - len(tracks))
         tasks = [
             asyncio.create_task(_search_one(query, provider, needed))
-            for provider in ("yt", "sc")
+            for provider in ("zv", "sc")
         ]
         if deadline is not None:
             wait_for_extra = max(0.0, deadline - time.monotonic())
@@ -690,11 +943,18 @@ def _download_audio_sync(
 ) -> tuple[Path, dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if track.provider == "yt" or is_youtube(track.url):
+        raise DownloadError(YOUTUBE_DISABLED)
+
     if track.provider == "hm":
         return _hitmo_download_sync(track, out_dir, on_progress)
+    if track.provider == "zv":
+        return _zvyki_download_sync(track, out_dir, on_progress)
     if _is_hitmo(track.url):
         # ссылка на страницу трека из Hitmo: разбираем её и качаем mp3
         return _hitmo_from_url_sync(track.url, out_dir, on_progress)
+    if _is_zvyki(track.url):
+        return _zvyki_from_url_sync(track.url, out_dir, on_progress)
 
     opts = _opts() | {
         "format": "bestaudio/best",
@@ -890,11 +1150,19 @@ def _download_media_sync(
     url: str, out_dir: Path, on_progress=None
 ) -> tuple[Path, dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if is_youtube(url):
+        raise DownloadError(YOUTUBE_DISABLED)
+
     url = _public_url(url)
 
     # Hitmo: yt-dlp не умеет его страницы треков, качаем своим путём
     if _is_hitmo(url):
         return _hitmo_from_url_sync(url, out_dir, on_progress)
+
+    # Zvyki: тоже свой разбор, отдаёт AAC
+    if _is_zvyki(url):
+        return _zvyki_from_url_sync(url, out_dir, on_progress)
 
     # 1) лёгкий проход без скачивания: узнаём форматы, размеры, метаданные
     def _probe():

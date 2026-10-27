@@ -34,9 +34,11 @@ from downloader import (
     SEMAPHORE as _semaphore,
     DownloadError,
     Track,
+    YOUTUBE_DISABLED,
     download_audio,
     download_media,
     is_music_link,
+    is_youtube,
     resolve_music_link,
     search,
 )
@@ -528,6 +530,10 @@ async def cb_track(callback: CallbackQuery) -> None:
 
 
 async def handle_link(message: Message, url: str) -> None:
+    if is_youtube(url):
+        await message.answer(YOUTUBE_DISABLED)
+        return
+
     if any(host in url for host in ("t.me/", "telegram.me/", "telegram.dog/")):
         await message.answer(
             "Ссылки на посты Telegram я не открываю: для этого нужен юзербот "

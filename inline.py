@@ -53,7 +53,7 @@ from downloader import (
     resolve_music_link,
     search,
 )
-from handlers import IMAGE_EXTS, safe_filename
+from handlers import IMAGE_EXTS, _media_caption, _track_label, safe_filename
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -250,8 +250,8 @@ async def _answer_music(query: InlineQuery, text: str, username: str) -> None:
         results.append(
             InlineQueryResultArticle(
                 id=token,
-                title=_short(f"{_fmt(track.duration)} {track.title}".strip(), 60),
-                description=_short(track.uploader or "Нажмите, чтобы скачать mp3", 80),
+                title=_short(_track_label(track), 60),
+                description=_short("Нажмите, чтобы скачать mp3", 80),
                 input_message_content=InputTextMessageContent(message_text="⬇️ Скачиваю…"),
                 reply_markup=_dl_kb(token),
             )
@@ -403,7 +403,7 @@ async def _inline_track(
             title=title,
             performer=performer or None,
             duration=int(info.get("duration") or track.duration or 0) or None,
-            caption=f'<a href="{html.escape(track.url)}">ссылка</a>',
+            caption=_media_caption(path, title, performer, track.url),
         )
         await _edit_inline(
             bot, inline_message_id, media, path, info, track.url, "audio", user_id
@@ -580,7 +580,7 @@ def _build_inline_media(path: Path, info: dict, source_url: str, mode: str):
     title = (info.get("title") or path.stem)[:180]
     performer = (info.get("artist") or info.get("uploader") or "")[:120]
     duration = int(info.get("duration") or 0) or None
-    caption = f'<a href="{html.escape(source_url)}">ссылка</a>'
+    caption = _media_caption(path, title, performer, source_url)
     file = FSInputFile(path, filename=safe_filename(title, ext))
 
     if mode == "document":

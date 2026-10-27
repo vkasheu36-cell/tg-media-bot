@@ -117,10 +117,29 @@ def _new_session(user_id: int, query: str, tracks: list[Track]) -> str:
     return sid
 
 
-def _track_label(track: Track) -> str:
+def _track_label(track: Track, limit: int = 60) -> str:
+    """«2:36 СТИНТ — Телепорт»: исполнитель виден сразу, название режется первым."""
     duration = fmt_duration(track.duration)
-    text = f"{duration} {track.title}" if duration else track.title
-    return text[:52]
+    title = " ".join(track.title.split())
+    artist = " ".join((track.uploader or "").split())
+    dur = f"{duration} " if duration else ""
+
+    # у SoundCloud и Hitmo исполнитель часто уже внутри названия
+    if not artist or artist.lower() in title.lower():
+        text = f"{dur}{title}"
+        if len(text) <= limit:
+            return text
+        return f"{dur}{title[: limit - len(dur) - 1]}…"
+
+    head = f"{dur}{artist} — "
+    if len(head) + len(title) <= limit:
+        return head + title
+
+    room = limit - len(head) - 1
+    if room >= 12:
+        return f"{head}{title[:room]}…"
+    # очень длинный исполнитель — режем всю строку
+    return f"{head}{title}"[: limit - 1] + "…"
 
 
 def results_keyboard(sid: str, page: int, tracks: list[Track]) -> InlineKeyboardMarkup:
@@ -275,6 +294,18 @@ async def _send_new(
     return await status.answer_document(document=file, caption=caption)
 
 
+def _track_caption(title: str, performer: str) -> str:
+    """Подпись у музыки — только исполнитель и название, без ссылки на источник."""
+    parts = [html.escape(p.strip()) for p in (performer, title) if p and p.strip()]
+    return " — ".join(parts)
+
+
+def _media_caption(path: Path, title: str, performer: str, source_url: str) -> str:
+    if path.suffix.lower() in AUDIO_EXTS:
+        return _track_caption(title, performer)
+    return f'<a href="{html.escape(source_url)}">ссылка</a>'
+
+
 async def deliver(
     status: Message,
     path: Path,
@@ -293,7 +324,7 @@ async def deliver(
     title = (info.get("track") or info.get("title") or fallback_title or path.stem)[:180]
     performer = (info.get("artist") or info.get("uploader") or fallback_performer or "")[:120]
     duration = int(info.get("duration") or 0) or None
-    caption = f'<a href="{html.escape(source_url)}">ссылка</a>'
+    caption = _media_caption(path, title, performer, source_url)
     cache_title = f"{performer} - {title}" if performer else title
 
     media, _ = _build_media(path, caption, title, performer, duration)

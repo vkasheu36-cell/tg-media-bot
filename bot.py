@@ -17,6 +17,7 @@ from aiogram.types import BotCommand
 import storage
 from config import (
     BOT_TOKEN,
+    COOKIES_FILE,
     DOWNLOADS_DIR,
     FFMPEG_DIR,
     MAX_UPLOAD_MB,
@@ -105,9 +106,10 @@ async def main() -> None:
 
     storage.cleanup()
     log.info(
-        "Бот запущен. Лимит отправки: %s МБ, ffmpeg: %s, прокси: %s",
+        "Бот запущен. Лимит отправки: %s МБ, ffmpeg: %s, cookies: %s, прокси: %s",
         MAX_UPLOAD_MB,
         FFMPEG_DIR or "не найден",
+        "есть" if COOKIES_FILE else "нет",
         TELEGRAM_PROXY or "нет",
     )
 

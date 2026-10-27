@@ -47,6 +47,7 @@ log = logging.getLogger(__name__)
 router = Router()
 
 PAGE_SIZE = 8
+SEARCH_LIMIT = 40  # ~5 страниц по 8 кнопок: оригинал обычно ниже каверов
 SESSION_TTL = 30 * 60  # полчаса — потом меню считается устаревшим
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
@@ -454,7 +455,7 @@ async def handle_music(message: Message, query: str, status: Message | None = No
             pass
 
     try:
-        tracks = await search(query)
+        tracks = await search(query, limit=SEARCH_LIMIT)
     except Exception:  # noqa: BLE001
         log.exception("search failed: %s", query)
         await _cleanup_notice(status, "❌ Поиск сломался. Попробуйте ещё раз.")

@@ -865,6 +865,96 @@ YOUTUBE_DISABLED = (
 )
 
 
+# Слова-маркеры «не оригинала»: каверы, ремиксы и ускорения не должны лезть
+# вперёд, но и не выбрасываются — вдруг человеку нужен именно ремикс.
+_VARIANT_HINTS = (
+    "cover",
+    "кавер",
+    "remix",
+    "ремикс",
+    "rmx",
+    "type beat",
+    "speed up",
+    "sped up",
+    "slowed",
+    "reverb",
+    "nightcore",
+    "bassboost",
+    "bass boost",
+    "hardstyle",
+    "mashup",
+    "gachi",
+    "8d",
+    "tiktok",
+    "phonk",
+    "drill",
+)
+
+
+_QUERY_DASH_RE = re.compile(r"\s+[-–—]\s*|\s*[-–—]\s+")
+
+
+def _query_words(query: str) -> list[str]:
+    return [w for w in re.findall(r"[0-9a-zа-яё]+", query.lower()) if len(w) > 2]
+
+
+def _split_query(query: str) -> tuple[str, str] | None:
+    """«фотографирую закат - fem.love» → («фотографирую закат», «fem.love»).
+
+    Тире с пробелами читаем как разделитель «автор — название». Порядок не
+    угадываем: в разметке треков встречается и тот, и другой.
+    """
+    parts = [p.strip() for p in _QUERY_DASH_RE.split(query) if p.strip()]
+    if len(parts) != 2:
+        return None
+    return parts[0], parts[1]
+
+
+def _rank_tracks(query: str, tracks: list[Track]) -> list[Track]:
+    """Оригиналы выше каверов; при «A - B» проверяем оба порядка автор/название."""
+    words = _query_words(query)
+    if not words:
+        return tracks
+
+    query_low = query.lower()
+    penalize = [hint for hint in _VARIANT_HINTS if hint not in query_low]
+    parts = _split_query(query)
+
+    def score(track: Track) -> int:
+        artist = (track.uploader or "").lower()
+        title = track.title.lower()
+        text = f"{artist} {title}"
+
+        def pair(artist_side: str, title_side: str) -> int:
+            value = 0
+            for word in _query_words(artist_side):
+                if word in artist:
+                    value += 3
+                elif word in title:
+                    value += 1
+            for word in _query_words(title_side):
+                if word in title:
+                    value += 3
+                elif word in artist:
+                    value += 1
+            return value
+
+        if parts:
+            value = max(pair(parts[0], parts[1]), pair(parts[1], parts[0]))
+        else:
+            value = 3 * sum(1 for word in words if word in artist)
+            value += 2 * sum(1 for word in words if word in title)
+
+        for hint in penalize:
+            if hint in text:
+                value -= 4
+        if track.provider == "hm":
+            value += 1
+        return value
+
+    return sorted(tracks, key=score, reverse=True)
+
+
 async def search(query: str, limit: int = 12, budget: float | None = None) -> list[Track]:
     """Ищет треки: Hitmo и Zvyki (готовые файлы), затем SoundCloud.
 
@@ -873,18 +963,25 @@ async def search(query: str, limit: int = 12, budget: float | None = None) -> li
     """
     deadline = time.monotonic() + budget if budget else None
 
-    hm_timeout = 8.0 if deadline is None else max(1.0, min(8.0, deadline - time.monotonic()))
+    # «A - B» отправляем поисковикам без тире: они лучше понимают набор слов,
+    # а к какому полю относится каждая часть, разберёмся при ранжировании.
+    parts = _split_query(query)
+    query_for_search = " ".join(parts) if parts else query
+
+    hm_timeout = 12.0 if deadline is None else max(1.0, min(12.0, deadline - time.monotonic()))
     try:
         tracks = await asyncio.wait_for(
-            _search_one(query, "hm", min(limit, 10)), timeout=hm_timeout
+            _search_one(query_for_search, "hm", min(limit, 30)), timeout=hm_timeout
         )
     except Exception:  # noqa: BLE001 — таймаут или сбой Hitmo
         tracks = []
 
-    if len(tracks) < min(4, limit):
+    # Hitmo редко отдаёт больше десятка треков — добираем Zvyki и SoundCloud,
+    # иначе список обрывается на нескольких результатах и страниц почти нет.
+    if len(tracks) < limit:
         needed = max(4, limit - len(tracks))
         tasks = [
-            asyncio.create_task(_search_one(query, provider, needed))
+            asyncio.create_task(_search_one(query_for_search, provider, needed))
             for provider in ("zv", "sc")
         ]
         if deadline is not None:
@@ -913,7 +1010,7 @@ async def search(query: str, limit: int = 12, budget: float | None = None) -> li
         seen.add(key)
         unique.append(track)
 
-    return unique[:limit]
+    return _rank_tracks(query, unique)[:limit]
 
 
 # ---------------------------------------------------------------- скачивание

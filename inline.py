@@ -138,7 +138,7 @@ def _start_search(key: str, query: str, limit: int) -> asyncio.Task:
     return task
 
 
-async def _search_fast(query: str, limit: int = 10) -> list[Track]:
+async def _search_fast(query: str, limit: int = 20) -> list[Track]:
     """Поиск, который укладывается в лимит inline-ответа (~10 с).
 
     Если не успели — отдаём то, что уже нашли для более короткого запроса,

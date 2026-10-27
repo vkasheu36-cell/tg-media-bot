@@ -17,7 +17,13 @@ from urllib.parse import urlsplit
 
 import yt_dlp
 
-from config import COOKIES_FILE, FFMPEG_DIR, MAX_UPLOAD_MB, PROXY
+from config import (
+    COOKIES_FILE,
+    FFMPEG_DIR,
+    MAX_UPLOAD_MB,
+    PROXY,
+    YT_PLAYER_CLIENT,
+)
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +97,10 @@ def _opts() -> dict:
         opts["cookiefile"] = COOKIES_FILE
     if PROXY:
         opts["proxy"] = PROXY
+    if YT_PLAYER_CLIENT:
+        opts["extractor_args"] = {
+            "youtube": {"player_client": [c.strip() for c in YT_PLAYER_CLIENT.split(",") if c.strip()]}
+        }
     if FFMPEG_DIR:
         opts["ffmpeg_location"] = FFMPEG_DIR
     return opts
@@ -200,7 +210,10 @@ def friendly_error(exc: Exception, url: str | None = None) -> str:
     if "no video could be found" in low:
         return f"{prefix}в этом посте нет видео, а картинку получить не удалось."
     if "sign in to confirm" in low or "not a bot" in low:
-        return f"{prefix}просит подтвердить вход.\nНужны cookies (README) или прокси."
+        return (
+            f"{prefix}не пускает сервер без входа.\n"
+            "Нужны cookies аккаунта — YT_COOKIES (README, раздел 2)."
+        )
     if "too many requests" in low or "http error 429" in low or "rate limit" in low:
         return f"{prefix}ограничил запросы.\nПодождите пару минут."
     if "logged-in" in low or "login" in low or "cookies" in low or "authentication" in low:

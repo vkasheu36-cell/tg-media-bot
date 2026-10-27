@@ -16,6 +16,24 @@ BOT_TOKEN: str = (os.getenv("BOT_TOKEN") or "").strip()
 # Необязательно: путь к cookies.txt (YouTube, Instagram, TikTok и т.д.)
 COOKIES_FILE: str | None = (os.getenv("COOKIES_FILE") or "").strip() or None
 
+# Необязательно: содержимое cookies.txt целиком, если файл положить некуда
+# (PaaS вроде Render: диск временный, зато есть переменные окружения).
+# Переводы строк можно писать как \n — при старте они превратятся в реальные.
+_YT_COOKIES = (os.getenv("YT_COOKIES") or "").strip()
+if _YT_COOKIES and not COOKIES_FILE:
+    try:
+        _cookies_path = BASE_DIR / "cookies.txt"
+        _cookies_path.write_text(
+            _YT_COOKIES.replace("\\n", "\n").rstrip("\n") + "\n", encoding="utf-8"
+        )
+        COOKIES_FILE = str(_cookies_path)
+    except OSError:
+        pass
+
+# Необязательно: какие клиенты YouTube пробовать, через запятую.
+# Пример: YT_PLAYER_CLIENT=default,android — иногда обходит проверку «не бот».
+YT_PLAYER_CLIENT: str = (os.getenv("YT_PLAYER_CLIENT") or "").strip()
+
 # Необязательно: прокси для yt-dlp, например socks5://127.0.0.1:1080
 PROXY: str | None = (os.getenv("PROXY") or "").strip() or None
 

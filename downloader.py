@@ -21,6 +21,7 @@ from config import (
     COOKIES_FILE,
     FFMPEG_DIR,
     MAX_UPLOAD_MB,
+    POT_SERVER,
     PROXY,
     YT_PLAYER_CLIENT,
 )
@@ -97,10 +98,16 @@ def _opts() -> dict:
         opts["cookiefile"] = COOKIES_FILE
     if PROXY:
         opts["proxy"] = PROXY
+    extractor_args: dict[str, dict[str, list[str]]] = {}
     if YT_PLAYER_CLIENT:
-        opts["extractor_args"] = {
-            "youtube": {"player_client": [c.strip() for c in YT_PLAYER_CLIENT.split(",") if c.strip()]}
+        extractor_args["youtube"] = {
+            "player_client": [c.strip() for c in YT_PLAYER_CLIENT.split(",") if c.strip()]
         }
+    if POT_SERVER:
+        # локальный провайдер PO-токенов: YouTube считает запрос «браузерным»
+        extractor_args["youtubepot-bgutilhttp"] = {"base_url": [POT_SERVER]}
+    if extractor_args:
+        opts["extractor_args"] = extractor_args
     if FFMPEG_DIR:
         opts["ffmpeg_location"] = FFMPEG_DIR
     return opts

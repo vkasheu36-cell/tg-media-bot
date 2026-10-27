@@ -34,6 +34,11 @@ if _YT_COOKIES and not COOKIES_FILE:
 # Пример: YT_PLAYER_CLIENT=default,android — иногда обходит проверку «не бот».
 YT_PLAYER_CLIENT: str = (os.getenv("YT_PLAYER_CLIENT") or "").strip()
 
+# Необязательно: адрес локального провайдера PO-токенов (bgutil).
+# Нужен на датацентровых IP, где YouTube требует подтверждение «я не робот».
+# В контейнере выставляется автоматически из start.sh.
+POT_SERVER: str = (os.getenv("POT_SERVER") or "").strip()
+
 # Необязательно: прокси для yt-dlp, например socks5://127.0.0.1:1080
 PROXY: str | None = (os.getenv("PROXY") or "").strip() or None
 

@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    container_name: tg-media-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./downloads:/app/downloads
+      # - ./cookies.txt:/app/cookies.txt:ro

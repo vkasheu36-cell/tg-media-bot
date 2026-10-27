@@ -1,0 +1,18 @@
+# Render Blueprint: создаёт бесплатный веб-сервис из Dockerfile.
+# Использование: Render → New → Blueprint → выбрать этот репозиторий → Apply.
+# BOT_TOKEN вводится в панели (sync: false), в git его нет.
+services:
+  - type: web
+    name: tg-media-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MAX_UPLOAD_MB
+        value: "49"
+      - key: WEBHOOK_SECRET
+        generateValue: true

@@ -1,0 +1,5 @@
+aiogram>=3.15,<4
+aiohttp-socks>=0.8
+yt-dlp>=2025.1.15
+python-dotenv>=1.0.1
+mutagen>=1.47.0

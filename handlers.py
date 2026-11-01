@@ -58,8 +58,8 @@ START_TEXT = (
     "👋 <b>Привет! Я умею две вещи:</b>\n\n"
     "🎵 <b>Музыка</b> — пришли название трека или «исполнитель - название», "
     "я найду варианты и пришлю mp3.\n\n"
-    "📥 <b>Медиа по ссылке</b> — кинь ссылку на YouTube (включая Shorts), TikTok, "
-    "Twitter/X, Instagram, Vimeo, Reddit, SoundCloud и многое другое — пришлю файл.\n\n"
+    "📥 <b>Медиа по ссылке</b> — кинь ссылку на TikTok, VK, Twitter/X, Instagram, "
+    "Vimeo, Reddit, SoundCloud и многое другое — пришлю файл.\n\n"
     "💬 <b>В любом чате</b> — набери <code>@имя_бота</code> и ссылку или название трека, "
     "не добавляя меня в чат.\n\n"
     "Лимит Telegram — 50 МБ на файл, поэтому видео автоматически ужимается по качеству."
@@ -69,8 +69,9 @@ HELP_TEXT = (
     "<b>Как пользоваться</b>\n\n"
     "• <code>девочка с дайвинчика</code> — поиск музыки\n"
     "• <code>https://www.tiktok.com/...</code> — скачать видео\n"
+    "• <code>https://vk.ru/video...</code> или <code>vk.ru/wall...</code> — видео из VK\n"
     "• <code>@имя_бота https://tiktok.com/...</code> — прямо в любом чате\n\n"
-    "Если YouTube отвечает «подтвердите, что вы не робот» — нужны cookies (README).\n"
+    "YouTube не поддерживается: с серверного IP он требует вход.\n"
     "Ссылки на посты Telegram не поддерживаются: для них нужен юзербот."
 )
 
@@ -394,7 +395,7 @@ async def cb_hint(callback: CallbackQuery) -> None:
     if callback.data == "hint:music":
         await callback.answer("Просто напиши название трека 🙂", show_alert=True)
     else:
-        await callback.answer("Кинь ссылку на видео — TikTok, YouTube, X и т.д.", show_alert=True)
+        await callback.answer("Кинь ссылку на видео — TikTok, VK, X и т.д.", show_alert=True)
 
 
 # ---------------------------------------------------------------- текст
@@ -570,7 +571,7 @@ async def handle_link(message: Message, url: str) -> None:
         await message.answer(
             "Ссылки на посты Telegram я не открываю: для этого нужен юзербот "
             "с доступом к аккаунту, а это отдельная история.\n"
-            "Пришлите прямую ссылку на видео (TikTok, YouTube, X и т.д.)."
+            "Пришлите прямую ссылку на видео (TikTok, VK, X и т.д.)."
         )
         return
 

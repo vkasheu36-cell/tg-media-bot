@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import yt_dlp
 
@@ -146,7 +146,10 @@ _SERVICES = {
     "twitter.com": "X",
     "x.com": "X",
     "vk.com": "VK",
+    "vk.ru": "VK",
     "vkvideo.ru": "VK",
+    "vk.cc": "VK",
+    "vk.link": "VK",
     "reddit.com": "Reddit",
     "vimeo.com": "Vimeo",
     "soundcloud.com": "SoundCloud",
@@ -205,6 +208,77 @@ def _public_url(url: str) -> str:
     return url
 
 
+def _is_vk(url: str) -> bool:
+    host = (urlsplit(url).netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return (
+        host in {"vk.com", "vk.ru", "vkvideo.ru", "vk.cc", "vk.link", "vk.me"}
+        or host.endswith(".vk.com")
+        or host.endswith(".vk.ru")
+    )
+
+
+def _vk_url(url: str) -> str:
+    """VK переехал на vk.ru, но yt-dlp посты на стене понимает только на vk.com.
+
+    Короткие vk.cc / vk.link раскрываем через редирект, домен приводим к vk.com.
+    """
+    host = (urlsplit(url).netloc or "").lower()
+    bare = host[4:] if host.startswith("www.") else host
+
+    if bare in {"vk.cc", "vk.link", "vk.me"}:
+        request = urllib.request.Request(url, headers=HITMO_HEADERS)
+        with urllib.request.urlopen(request, timeout=15) as response:
+            url = response.geturl()
+
+    parts = urlsplit(url)
+    host = (parts.netloc or "").lower()
+    if host.endswith("vk.ru"):
+        host = host[: -len("vk.ru")] + "vk.com"
+    return urlunsplit((parts.scheme or "https", host, parts.path, parts.query, parts.fragment))
+
+
+_VK_EMBED_RES = (
+    re.compile(r'<meta[^>]+property="og:video(?::url)?"[^>]+content="([^"]+)"', re.I),
+    re.compile(r'<meta[^>]+content="([^"]+)"[^>]+property="og:video(?::url)?"', re.I),
+    re.compile(r"(https?:(?:\\?/){2}vk(?:video)?\.(?:com|ru)/video_ext\.php\?[^\"'\\\s<>]+)", re.I),
+    re.compile(r"video_ext\.php\?[^\"'\\\s<>]+", re.I),
+)
+
+
+def _vk_embed_url(url: str) -> str | None:
+    """Страница VK без прямой ссылки на видео: ищем вложение в HTML."""
+    try:
+        request = urllib.request.Request(
+            url, headers={**HITMO_HEADERS, "Accept-Language": "ru-RU,ru;q=0.9"}
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = response.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001
+        log.debug("VK: страница не открылась: %s", exc)
+        return None
+
+    for pattern in _VK_EMBED_RES:
+        match = pattern.search(body)
+        if not match:
+            continue
+        candidate = match.group(1) if match.groups() else match.group(0)
+        candidate = html.unescape(candidate).replace("\\/", "/")
+        if candidate.startswith("//"):
+            candidate = "https:" + candidate
+        if candidate.startswith("video_ext.php"):
+            candidate = "https://vk.com/" + candidate
+        if "video_ext.php" in candidate or re.search(r"vk(?:video)?\.(?:com|ru)/(?:video|clip)", candidate):
+            return candidate
+
+    # последний шанс: любой id вида video-123_456 на странице
+    match = re.search(r"video(-?\d+_\d+)", body)
+    if match:
+        return f"https://vk.com/video{match.group(1)}"
+    return None
+
+
 def _dns_retry(func, attempts: int = 3, delay: float = 1.5):
     """DNS через VPN иногда отвечает «getaddrinfo failed» — повторяем запрос."""
     last: Exception | None = None
@@ -260,6 +334,11 @@ def friendly_error(exc: Exception, url: str | None = None) -> str:
             return "Hitmo не отдал файл.\nПопробуйте другую ссылку или трек."
         return f"{prefix}запретил доступ (403).\nСкорее всего, нужны cookies."
     if "unsupported url" in low or "no suitable extractor" in low:
+        if url and _is_vk(url):
+            return (
+                "VK: не понял ссылку.\n"
+                "Пришлите ссылку на видео (vk.com/video…), клип или пост, где есть видео."
+            )
         return f"{prefix}этот сервис не поддерживается."
     if "geo" in low and "block" in low:
         return f"{prefix}заблокировано в регионе сервера.\nПопробуйте прокси."
@@ -1053,6 +1132,8 @@ def _download_audio_sync(
     if _is_zvyki(track.url):
         return _zvyki_from_url_sync(track.url, out_dir, on_progress)
 
+    url = _vk_url(track.url) if _is_vk(track.url) else track.url
+
     opts = _opts() | {
         "format": "bestaudio/best",
         "outtmpl": str(out_dir / "%(title).80s.%(ext)s"),
@@ -1071,7 +1152,7 @@ def _download_audio_sync(
 
     def _fetch():
         with yt_dlp.YoutubeDL(opts) as ydl:
-            data = ydl.extract_info(_public_url(track.url), download=True)
+            data = ydl.extract_info(_public_url(url), download=True)
             return ydl.sanitize_info(data) if data else {}
 
     info = _dns_retry(_fetch)
@@ -1253,6 +1334,10 @@ def _download_media_sync(
 
     url = _public_url(url)
 
+    # VK: vk.ru → vk.com (yt-dlp понимает посты на стене только на vk.com)
+    if _is_vk(url):
+        url = _vk_url(url)
+
     # Hitmo: yt-dlp не умеет его страницы треков, качаем своим путём
     if _is_hitmo(url):
         return _hitmo_from_url_sync(url, out_dir, on_progress)
@@ -1274,7 +1359,15 @@ def _download_media_sync(
         if fallback:
             log.info("X: медиа получено через API (%s)", fallback[0].name)
             return fallback
-        raise
+
+        # VK: бывают ссылки, которые yt-dlp не узнаёт, — вытаскиваем вложение
+        # со страницы и пробуем ещё раз
+        embed = _vk_embed_url(url) if _is_vk(url) else None
+        if not embed:
+            raise
+        log.info("VK: вложение найдено на странице: %s", embed)
+        url = embed
+        info = _dns_retry(_probe)
 
     if not info:
         fallback = _x_media_sync(url, out_dir)
@@ -1285,8 +1378,30 @@ def _download_media_sync(
     if info.get("_type") == "playlist":
         entries = [e for e in (info.get("entries") or []) if e]
         if not entries:
-            raise DownloadError("По ссылке не нашлось медиа.")
-        info = entries[0]
+            raise DownloadError("По ссылке не нашлось медиа — в посте нет видео.")
+        entry = entries[0]
+
+        # пост на стене: внутри лежит отдельное видео — качаем именно его
+        entry_url = (entry.get("webpage_url") or entry.get("url") or "").strip()
+        if entry_url.startswith("http") and entry_url != url:
+            url = entry_url
+            try:
+                info = _dns_retry(_probe)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("VK: вложение не разобралось (%s): %s", entry_url, exc)
+                info = entry
+        else:
+            info = entry
+
+        # вложение-аудио: страницы нет, зато есть прямой URL файла
+        if not info.get("formats") and entry.get("formats"):
+            direct = (entry["formats"][-1] or {}).get("url")
+            if direct:
+                data = _http_get(direct, timeout=120)
+                ext = ".m4a" if (entry["formats"][-1] or {}).get("ext") == "m4a" else ".mp3"
+                path = out_dir / f"{entry.get('id') or 'vk'}{ext}"
+                path.write_bytes(data)
+                return path, entry
 
     budget = MAX_UPLOAD_MB * 1024 * 1024
     last_error: Exception | None = None
@@ -1301,6 +1416,7 @@ def _download_media_sync(
         opts = _opts() | {
             "format": fmt,
             "merge_output_format": "mp4",
+            "playlist_items": "1",
             "outtmpl": str(out_dir / "%(title).80s [%(id)s].%(ext)s"),
             "max_filesize": budget,
             "progress_hooks": _progress_hook(on_progress),

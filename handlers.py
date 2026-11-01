@@ -41,6 +41,7 @@ from downloader import (
     is_youtube,
     resolve_music_link,
     search,
+    service_name,
 )
 
 log = logging.getLogger(__name__)
@@ -429,10 +430,11 @@ async def handle_music_link(message: Message, url: str) -> None:
     status = await message.answer("🔗 Разбираю ссылку…")
     query = await resolve_music_link(url)
     if not query:
+        service = service_name(url)
         await _cleanup_notice(
             status,
-            "❌ Не удалось разобрать ссылку.\n"
-            "Пришлите ссылку на конкретный трек или название текстом.",
+            f"❌ {service}: не удалось разобрать ссылку.\n"
+            "Напишите «исполнитель - название» текстом — найду вручную.",
         )
         return
     await handle_music(message, query, status=status)

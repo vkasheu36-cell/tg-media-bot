@@ -367,14 +367,19 @@ def is_music_link(url: str) -> bool:
     )
 
 
-def _fetch_text(url: str, user_agent: str, timeout: float = 20.0) -> str:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": user_agent,
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        },
-    )
+def _fetch_text(
+    url: str,
+    user_agent: str,
+    timeout: float = 20.0,
+    headers: dict[str, str] | None = None,
+) -> str:
+    merged = {
+        "User-Agent": user_agent,
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    }
+    if headers:
+        merged.update(headers)
+    request = urllib.request.Request(url, headers=merged)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read().decode("utf-8", "replace")
 
@@ -426,19 +431,43 @@ def _apple_query_sync(url: str) -> str | None:
     return None
 
 
-def _yandex_query_sync(url: str) -> str | None:
-    """Публичный API Яндекс.Музыки работает без токена."""
-    match = YANDEX_MUSIC_RE.search(url)
-    album_match = YANDEX_ALBUM_RE.search(url)
-    if match:
-        api = f"https://api.music.yandex.net/tracks/{match.group(1)}"
-    elif album_match:
-        api = f"https://api.music.yandex.net/albums/{album_match.group(1)}"
-    else:
-        return None
+_YANDEX_API_HOSTS = (
+    "api.music.yandex.net",
+    "api.music.yandex.com",
+    "api.music.yandex.ru",
+)
+_YANDEX_PAGE_HOSTS = ("music.yandex.ru", "music.yandex.com")
+# бюджет на весь разбор: с датацентрового IP часть запросов может висеть
+_YANDEX_BUDGET = 22.0
 
-    data = json.loads(_fetch_text(api, "Mozilla/5.0"))
-    result = data.get("result")
+
+def _yandex_meta(body: str, prop: str) -> str:
+    """Достаём og-тег, не завязываясь на порядок атрибутов."""
+    for tag in re.findall(r"<meta\b[^>]*>", body, re.I):
+        if f"og:{prop}" not in tag:
+            continue
+        found = re.search(r'content=["\']([^"\']*)["\']', tag, re.I)
+        if found:
+            return html.unescape(found.group(1)).strip()
+    return ""
+
+
+def _yandex_og_query(body: str) -> str | None:
+    """og:title — название, og:description — «Исполнитель • Трек • 2024»."""
+    title = _yandex_meta(body, "title")
+    description = _yandex_meta(body, "description")
+    title = re.sub(r"\s*слушать онлайн.*$", "", title, flags=re.I).strip()
+    if not title or "яндекс музыка" in title.lower():
+        return None  # заглушка/капча вместо страницы трека
+    artist = description.split("•")[0].strip()
+    if "яндекс музыка" in artist.lower() or "слушать" in artist.lower():
+        artist = ""
+    if artist and title.lower().startswith(artist.lower()):
+        return title
+    return f"{artist} {title}".strip() or None
+
+
+def _yandex_item_query(result) -> str | None:
     if isinstance(result, list):
         item = result[0] if result else None
     else:
@@ -448,6 +477,111 @@ def _yandex_query_sync(url: str) -> str | None:
     artists = ", ".join(a.get("name", "") for a in item.get("artists") or []).strip(", ")
     title = item.get("title") or ""
     return f"{artists} {title}".strip() or None
+
+
+def _yandex_api_query(
+    track_id: str | None, album_id: str | None, deadline: float
+) -> str | None:
+    path = f"/tracks/{track_id}" if track_id else f"/albums/{album_id}"
+    last: Exception | None = None
+    answered = False
+    for host in _YANDEX_API_HOSTS:
+        left = deadline - time.monotonic()
+        if left <= 1:
+            break
+        try:
+            body = _fetch_text(
+                f"https://{host}{path}",
+                HITMO_HEADERS["User-Agent"],
+                timeout=min(10.0, left),
+                headers=HITMO_HEADERS,
+            )
+            query = _yandex_item_query(json.loads(body).get("result"))
+            answered = True
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            log.debug("Яндекс.Музыка: API %s не ответил: %s", host, exc)
+            continue
+        if query:
+            return query
+        log.debug("Яндекс.Музыка: API %s вернул пустой результат", host)
+    if not answered and last is not None:
+        raise last
+    return None
+
+
+def _yandex_page_query(
+    track_id: str | None, album_id: str | None, deadline: float
+) -> str | None:
+    """Запасной путь: og-теги страницы трека (API с Render иногда отдаёт 403)."""
+    paths: list[str] = []
+    if track_id:
+        paths.append(f"/track/{track_id}")
+        if album_id:
+            paths.append(f"/album/{album_id}/track/{track_id}")
+    if album_id:
+        paths.append(f"/album/{album_id}")
+
+    last: Exception | None = None
+    answered = False
+    for host in _YANDEX_PAGE_HOSTS:
+        for path in paths:
+            left = deadline - time.monotonic()
+            if left <= 1:
+                break
+            try:
+                body = _fetch_text(
+                    f"https://{host}{path}",
+                    HITMO_HEADERS["User-Agent"],
+                    timeout=min(10.0, left),
+                    headers=HITMO_HEADERS,
+                )
+                answered = True
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                log.debug("Яндекс.Музыка: страница %s%s не открылась: %s", host, path, exc)
+                continue
+            query = _yandex_og_query(body)
+            if query:
+                log.info("Яндекс.Музыка: метаданные взяты со страницы %s%s", host, path)
+                return query
+    if not answered and last is not None:
+        raise last
+    return None
+
+
+def _yandex_query_sync(url: str) -> str | None:
+    """Метаданные Яндекс.Музыки: публичный API, при отказе — og-теги страницы.
+
+    Публичный API работает без токена, но с датацентровых IP (Render) бывает
+    403/таймаут, поэтому пробуем несколько хостов и разбор HTML.
+    """
+    match = YANDEX_MUSIC_RE.search(url)
+    album_match = YANDEX_ALBUM_RE.search(url)
+    track_id = match.group(1) if match else None
+    album_id = album_match.group(1) if album_match else None
+    if not track_id and not album_id:
+        return None
+
+    deadline = time.monotonic() + _YANDEX_BUDGET
+    problems: list[str] = []
+    for name, func in (
+        ("API", _yandex_api_query),
+        ("страница", _yandex_page_query),
+    ):
+        try:
+            query = func(track_id, album_id, deadline)
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"{name}: {type(exc).__name__}: {exc}")
+            continue
+        if query:
+            return query
+        problems.append(f"{name}: пустой ответ")
+
+    log.warning(
+        "Яндекс.Музыка: не удалось разобрать %s (%s)", url, "; ".join(problems) or "нет данных"
+    )
+    return None
 
 
 async def resolve_music_link(url: str) -> str | None:
@@ -462,9 +596,9 @@ async def resolve_music_link(url: str) -> str | None:
         return None
 
     try:
-        return await asyncio.wait_for(asyncio.to_thread(func, url), timeout=15)
+        return await asyncio.wait_for(asyncio.to_thread(func, url), timeout=30)
     except Exception as exc:  # noqa: BLE001
-        log.warning("music link resolve failed: %s: %s", url, exc)
+        log.warning("music link resolve failed: %s: %s: %s", url, type(exc).__name__, exc)
         return None
 
 

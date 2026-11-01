@@ -239,44 +239,87 @@ def _vk_url(url: str) -> str:
     return urlunsplit((parts.scheme or "https", host, parts.path, parts.query, parts.fragment))
 
 
-_VK_EMBED_RES = (
-    re.compile(r'<meta[^>]+property="og:video(?::url)?"[^>]+content="([^"]+)"', re.I),
-    re.compile(r'<meta[^>]+content="([^"]+)"[^>]+property="og:video(?::url)?"', re.I),
-    re.compile(r"(https?:(?:\\?/){2}vk(?:video)?\.(?:com|ru)/video_ext\.php\?[^\"'\\\s<>]+)", re.I),
-    re.compile(r"video_ext\.php\?[^\"'\\\s<>]+", re.I),
-)
+VK_META_UA = "TelegramBot (like TwitterBot)"
+# заглушка VK для постов без вложения: 1920x1010 «Пост из ленты ВКонтакте»
+VK_STUB_IMAGE = "fafvjSB8ha2EWPn-VR6LIahBtBkf50LZSLbKfQ/BiN2pjgeJTw.png"
+_VK_VIDEO_PATH_RE = re.compile(r"/(?:video|clip)-?\d", re.I)
 
 
-def _vk_embed_url(url: str) -> str | None:
-    """Страница VK без прямой ссылки на видео: ищем вложение в HTML."""
+def _meta_value(body: str, key: str) -> str:
+    """og-тег по имени: порядок атрибутов и content/value бывают разными."""
+    for tag in re.findall(r"<meta\b[^>]*>", body, re.I):
+        if not re.search(
+            rf'\b(?:property|name)\s*=\s*["\']{re.escape(key)}["\']', tag, re.I
+        ):
+            continue
+        found = re.search(r'\b(?:content|value)\s*=\s*["\']([^"\']*)["\']', tag, re.I)
+        if found:
+            return html.unescape(found.group(1)).strip()
+    return ""
+
+
+def _vk_og_media(url: str) -> tuple[str, str] | None:
+    """Что прикреплено к странице VK: ("photo"|"video"|"embed", url).
+
+    Обычному браузеру VK отдаёт пустую JS-страницу (а на фото — редирект на
+    badbrowser.php), зато боту предпросмотра отдаёт готовые og:image/og:video.
+    Так разбираются ссылки на фото и посты, которые yt-dlp не понимает.
+    """
     try:
         request = urllib.request.Request(
-            url, headers={**HITMO_HEADERS, "Accept-Language": "ru-RU,ru;q=0.9"}
+            url,
+            headers={
+                "User-Agent": VK_META_UA,
+                "Accept-Language": "ru-RU,ru;q=0.9",
+            },
         )
         with urllib.request.urlopen(request, timeout=20) as response:
             body = response.read().decode("utf-8", "replace")
     except Exception as exc:  # noqa: BLE001
-        log.debug("VK: страница не открылась: %s", exc)
+        log.debug("VK: OG-страница не открылась: %s", exc)
         return None
 
-    for pattern in _VK_EMBED_RES:
-        match = pattern.search(body)
-        if not match:
-            continue
-        candidate = match.group(1) if match.groups() else match.group(0)
-        candidate = html.unescape(candidate).replace("\\/", "/")
-        if candidate.startswith("//"):
-            candidate = "https:" + candidate
-        if candidate.startswith("video_ext.php"):
-            candidate = "https://vk.com/" + candidate
-        if "video_ext.php" in candidate or re.search(r"vk(?:video)?\.(?:com|ru)/(?:video|clip)", candidate):
-            return candidate
+    video = (
+        _meta_value(body, "og:video:secure_url")
+        or _meta_value(body, "og:video:url")
+        or _meta_value(body, "og:video")
+    )
+    if video:
+        if "video_ext.php" in video:
+            return "embed", video
+        if urlsplit(video).path.lower().endswith((".mp4", ".m4v", ".mov", ".webm")):
+            return "video", video
+        # og:video вида vkvideo.ru/video… — это страница, её и так берёт yt-dlp
+        return None
 
-    # последний шанс: любой id вида video-123_456 на странице
-    match = re.search(r"video(-?\d+_\d+)", body)
-    if match:
-        return f"https://vk.com/video{match.group(1)}"
-    return None
+    image = _meta_value(body, "og:image:secure_url") or _meta_value(body, "og:image")
+    if image.startswith("//"):
+        image = "https:" + image
+    if not image.startswith("http"):
+        return None
+    if _VK_VIDEO_PATH_RE.search(urlsplit(url).path):
+        return None  # у страницы видео фото-вложения нет
+    if VK_STUB_IMAGE in image:
+        return None  # заглушка «Пост из ленты ВКонтакте», а не вложение
+    if not _meta_value(body, "og:url"):
+        # у постов без вложения VK отдаёт только title/description/заглушку
+        return None
+    return "photo", image
+
+
+def _vk_download_direct(kind: str, media_url: str, out_dir: Path) -> tuple[Path, dict]:
+    """Фото/видео VK качаем напрямую по ссылке из OG-тегов."""
+    log.info("VK: качаю %s напрямую: %s", kind, media_url)
+    data = _http_get(media_url, timeout=120)
+    ext = _guess_ext(media_url)
+    if kind == "photo":
+        if ext not in {".jpg", ".png", ".webp", ".gif"}:
+            ext = ".jpg"
+    elif ext not in {".mp4", ".m4v", ".mov", ".webm"}:
+        ext = ".mp4"
+    path = out_dir / f"vk{ext}"
+    path.write_bytes(data)
+    return path, {"id": "", "title": "", "duration": None}
 
 
 def _dns_retry(func, attempts: int = 3, delay: float = 1.5):
@@ -437,19 +480,35 @@ _YANDEX_API_HOSTS = (
     "api.music.yandex.ru",
 )
 _YANDEX_PAGE_HOSTS = ("music.yandex.ru", "music.yandex.com")
+# VK и Яндекс отдают готовые OG-теги «ботам предпросмотра» даже с чужих IP
+_YANDEX_PAGE_UAS = (
+    HITMO_HEADERS["User-Agent"],
+    "TelegramBot (like TwitterBot)",
+    "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+)
+_YANDEX_API_HEADERS = {
+    **HITMO_HEADERS,
+    "Accept": "application/json",
+    "X-Yandex-Music-Client": "YandexMusicWeb/1.0",
+}
 # бюджет на весь разбор: с датацентрового IP часть запросов может висеть
 _YANDEX_BUDGET = 22.0
 
 
+def _yandex_paths(track_id: str | None, album_id: str | None) -> list[str]:
+    paths: list[str] = []
+    if track_id:
+        paths.append(f"/track/{track_id}")
+        if album_id:
+            paths.append(f"/album/{album_id}/track/{track_id}")
+    if album_id:
+        paths.append(f"/album/{album_id}")
+    return paths
+
+
 def _yandex_meta(body: str, prop: str) -> str:
     """Достаём og-тег, не завязываясь на порядок атрибутов."""
-    for tag in re.findall(r"<meta\b[^>]*>", body, re.I):
-        if f"og:{prop}" not in tag:
-            continue
-        found = re.search(r'content=["\']([^"\']*)["\']', tag, re.I)
-        if found:
-            return html.unescape(found.group(1)).strip()
-    return ""
+    return _meta_value(body, f"og:{prop}")
 
 
 def _yandex_og_query(body: str) -> str | None:
@@ -494,7 +553,7 @@ def _yandex_api_query(
                 f"https://{host}{path}",
                 HITMO_HEADERS["User-Agent"],
                 timeout=min(10.0, left),
-                headers=HITMO_HEADERS,
+                headers=_YANDEX_API_HEADERS,
             )
             query = _yandex_item_query(json.loads(body).get("result"))
             answered = True
@@ -514,47 +573,84 @@ def _yandex_page_query(
     track_id: str | None, album_id: str | None, deadline: float
 ) -> str | None:
     """Запасной путь: og-теги страницы трека (API с Render иногда отдаёт 403)."""
-    paths: list[str] = []
-    if track_id:
-        paths.append(f"/track/{track_id}")
-        if album_id:
-            paths.append(f"/album/{album_id}/track/{track_id}")
-    if album_id:
-        paths.append(f"/album/{album_id}")
+    paths = _yandex_paths(track_id, album_id)
 
     last: Exception | None = None
     answered = False
+    for ua in _YANDEX_PAGE_UAS:
+        for host in _YANDEX_PAGE_HOSTS:
+            for path in paths:
+                left = deadline - time.monotonic()
+                if left <= 1:
+                    break
+                try:
+                    body = _fetch_text(
+                        f"https://{host}{path}",
+                        ua,
+                        timeout=min(8.0, left),
+                    )
+                    answered = True
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+                    log.debug(
+                        "Яндекс.Музыка: страница %s%s не открылась: %s", host, path, exc
+                    )
+                    continue
+                query = _yandex_og_query(body)
+                if query:
+                    log.info("Яндекс.Музыка: метаданные взяты со страницы %s%s", host, path)
+                    return query
+        if deadline - time.monotonic() <= 1:
+            break
+    if not answered and last is not None:
+        raise last
+    return None
+
+
+def _yandex_proxy_query(
+    track_id: str | None, album_id: str | None, deadline: float
+) -> str | None:
+    """Последний шанс: страница через прокси Google-переводчика.
+
+    music.yandex.ru → music-yandex-ru.translate.goog: запрос выполняют серверы
+    Google, которых Яндекс не блокирует, а OG-теги остаются в HTML как есть.
+    """
+    paths = _yandex_paths(track_id, album_id)
+    last: Exception | None = None
+    answered = False
     for host in _YANDEX_PAGE_HOSTS:
+        proxy = "https://" + host.replace(".", "-") + ".translate.goog"
         for path in paths:
             left = deadline - time.monotonic()
             if left <= 1:
                 break
+            url = f"{proxy}{path}?_x_tr_sl=ru&_x_tr_tl=en&_x_tr_hl=en"
             try:
                 body = _fetch_text(
-                    f"https://{host}{path}",
+                    url,
                     HITMO_HEADERS["User-Agent"],
                     timeout=min(10.0, left),
-                    headers=HITMO_HEADERS,
                 )
                 answered = True
             except Exception as exc:  # noqa: BLE001
                 last = exc
-                log.debug("Яндекс.Музыка: страница %s%s не открылась: %s", host, path, exc)
+                log.debug("Яндекс.Музыка: прокси %s не ответил: %s", proxy, exc)
                 continue
             query = _yandex_og_query(body)
             if query:
-                log.info("Яндекс.Музыка: метаданные взяты со страницы %s%s", host, path)
+                log.info("Яндекс.Музыка: метаданные получены через прокси %s", proxy)
                 return query
     if not answered and last is not None:
         raise last
     return None
 
 
-def _yandex_query_sync(url: str) -> str | None:
-    """Метаданные Яндекс.Музыки: публичный API, при отказе — og-теги страницы.
+def _yandex_query_sync(url: str, problems: list[str] | None = None) -> str | None:
+    """Метаданные Яндекс.Музыки: API → OG-теги страницы → прокси.
 
     Публичный API работает без токена, но с датацентровых IP (Render) бывает
-    403/таймаут, поэтому пробуем несколько хостов и разбор HTML.
+    403/таймаут, поэтому пробуем несколько хостов, «ботовые» User-Agent и
+    страницу через прокси.
     """
     match = YANDEX_MUSIC_RE.search(url)
     album_match = YANDEX_ALBUM_RE.search(url)
@@ -563,43 +659,54 @@ def _yandex_query_sync(url: str) -> str | None:
     if not track_id and not album_id:
         return None
 
+    reasons = problems if problems is not None else []
     deadline = time.monotonic() + _YANDEX_BUDGET
-    problems: list[str] = []
     for name, func in (
         ("API", _yandex_api_query),
         ("страница", _yandex_page_query),
+        ("прокси", _yandex_proxy_query),
     ):
         try:
             query = func(track_id, album_id, deadline)
         except Exception as exc:  # noqa: BLE001
-            problems.append(f"{name}: {type(exc).__name__}: {exc}")
+            reasons.append(f"{name}: {type(exc).__name__}: {exc}")
             continue
         if query:
             return query
-        problems.append(f"{name}: пустой ответ")
+        reasons.append(f"{name}: пустой ответ")
 
     log.warning(
-        "Яндекс.Музыка: не удалось разобрать %s (%s)", url, "; ".join(problems) or "нет данных"
+        "Яндекс.Музыка: не удалось разобрать %s (%s)",
+        url,
+        "; ".join(reasons) or "нет данных",
     )
     return None
 
 
-async def resolve_music_link(url: str) -> str | None:
-    """Превращает ссылку стриминга в поисковый запрос «исполнитель название»."""
+async def resolve_music_link_detailed(url: str) -> tuple[str | None, str]:
+    """Как resolve_music_link, но ещё и причина отказа (для сообщения)."""
+    reasons: list[str] = []
     if SPOTIFY_RE.search(url) or SPOTIFY_ALBUM_RE.search(url):
         func = _spotify_query_sync
     elif APPLE_MUSIC_RE.search(url):
         func = _apple_query_sync
     elif YANDEX_MUSIC_RE.search(url) or YANDEX_ALBUM_RE.search(url):
-        func = _yandex_query_sync
+        func = lambda link: _yandex_query_sync(link, reasons)  # noqa: E731
     else:
-        return None
+        return None, ""
 
     try:
-        return await asyncio.wait_for(asyncio.to_thread(func, url), timeout=30)
+        query = await asyncio.wait_for(asyncio.to_thread(func, url), timeout=30)
     except Exception as exc:  # noqa: BLE001
         log.warning("music link resolve failed: %s: %s: %s", url, type(exc).__name__, exc)
-        return None
+        return None, f"{type(exc).__name__}: {exc}"
+    return query, "; ".join(reasons)
+
+
+async def resolve_music_link(url: str) -> str | None:
+    """Превращает ссылку стриминга в поисковый запрос «исполнитель название»."""
+    query, _ = await resolve_music_link_detailed(url)
+    return query
 
 
 # ---------------------------------------------------------------- поиск музыки
@@ -1494,14 +1601,18 @@ def _download_media_sync(
             log.info("X: медиа получено через API (%s)", fallback[0].name)
             return fallback
 
-        # VK: бывают ссылки, которые yt-dlp не узнаёт, — вытаскиваем вложение
-        # со страницы и пробуем ещё раз
-        embed = _vk_embed_url(url) if _is_vk(url) else None
-        if not embed:
+        # VK: фото-страницы и посты yt-dlp не разбирает — берём вложение из
+        # OG-тегов, которые VK отдаёт боту предпросмотра
+        og = _vk_og_media(url) if _is_vk(url) else None
+        if not og:
             raise
-        log.info("VK: вложение найдено на странице: %s", embed)
-        url = embed
-        info = _dns_retry(_probe)
+        kind, media = og
+        if kind == "embed":
+            log.info("VK: видео найдено на странице: %s", media)
+            url = media
+            info = _dns_retry(_probe)
+        else:
+            return _vk_download_direct(kind, media, out_dir)
 
     if not info:
         fallback = _x_media_sync(url, out_dir)
@@ -1512,7 +1623,21 @@ def _download_media_sync(
     if info.get("_type") == "playlist":
         entries = [e for e in (info.get("entries") or []) if e]
         if not entries:
-            raise DownloadError("По ссылке не нашлось медиа — в посте нет видео.")
+            # VK: пост без аудио — возможно, там фото или видео
+            og = _vk_og_media(url) if _is_vk(url) else None
+            if og and og[0] == "embed":
+                log.info("VK: видео найдено на странице: %s", og[1])
+                url = og[1]
+                info = _dns_retry(_probe)
+                entries = (
+                    [e for e in (info.get("entries") or []) if e]
+                    if info.get("_type") == "playlist"
+                    else [info]
+                )
+            elif og:
+                return _vk_download_direct(og[0], og[1], out_dir)
+            if not entries:
+                raise DownloadError("По ссылке не нашлось медиа — в посте нет видео или фото.")
         entry = entries[0]
 
         # пост на стене: внутри лежит отдельное видео — качаем именно его
@@ -1536,6 +1661,12 @@ def _download_media_sync(
                 path = out_dir / f"{entry.get('id') or 'vk'}{ext}"
                 path.write_bytes(data)
                 return path, entry
+
+    # VK: страница без видеоформатов (фото-пост) — берём картинку из OG-тегов
+    if _is_vk(url) and not info.get("formats"):
+        og = _vk_og_media(url)
+        if og and og[0] != "embed":
+            return _vk_download_direct(og[0], og[1], out_dir)
 
     budget = MAX_UPLOAD_MB * 1024 * 1024
     last_error: Exception | None = None

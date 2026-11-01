@@ -39,7 +39,7 @@ from downloader import (
     download_media,
     is_music_link,
     is_youtube,
-    resolve_music_link,
+    resolve_music_link_detailed,
     search,
     service_name,
 )
@@ -428,12 +428,13 @@ async def on_text(message: Message) -> None:
 async def handle_music_link(message: Message, url: str) -> None:
     """Spotify/Apple Music/Яндекс.Музыка → ищем трек по «исполнитель название»."""
     status = await message.answer("🔗 Разбираю ссылку…")
-    query = await resolve_music_link(url)
+    query, reason = await resolve_music_link_detailed(url)
     if not query:
         service = service_name(url)
+        hint = f"\nПричина: {html.escape(reason[:160])}" if reason else ""
         await _cleanup_notice(
             status,
-            f"❌ {service}: не удалось разобрать ссылку.\n"
+            f"❌ {service}: не удалось разобрать ссылку.{hint}\n"
             "Напишите «исполнитель - название» текстом — найду вручную.",
         )
         return

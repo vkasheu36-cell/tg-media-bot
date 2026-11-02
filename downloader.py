@@ -1606,7 +1606,7 @@ FA_MATURE = (
 )
 
 _FA_LOCK = threading.Lock()
-_FA_STATE: dict = {"opener": None, "logged": False, "last_try": 0.0}
+_FA_STATE: dict = {"opener": None, "jar": None, "logged": False, "last_try": 0.0}
 _FA_LOGIN_COOLDOWN = 600.0  # не долбим FA логином чаще раза в 10 минут
 
 
@@ -1686,8 +1686,10 @@ def _fa_opener():
     """Один opener на процесс: он и хранит cookies сессии FurAffinity."""
     with _FA_LOCK:
         if _FA_STATE["opener"] is None:
+            jar = http.cookiejar.CookieJar()
+            _FA_STATE["jar"] = jar
             _FA_STATE["opener"] = urllib.request.build_opener(
-                urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+                urllib.request.HTTPCookieProcessor(jar)
             )
         return _FA_STATE["opener"]
 
@@ -1715,53 +1717,105 @@ def _fa_post(url: str, data: bytes, ua: str = FA_UA, timeout: float = 30) -> str
         return response.read().decode("utf-8", "replace")
 
 
-def _fa_login() -> bool:
-    """Вход в аккаунт: без него FA не показывает работы 18+."""
+def _fa_raw_attr(tag: str, name: str) -> str:
+    """Значение атрибута как есть — для полей формы, где нет http-ссылок."""
+    found = re.search(rf'\b{name}\s*=\s*["\']([^"\']*)["\']', tag, re.I)
+    return html.unescape(found.group(1)).strip() if found else ""
+
+
+def _fa_login_payload(body: str) -> tuple[str, dict[str, str], str]:
+    """Собираем форму входа из HTML: имена полей у FA меняются.
+
+    Берём форму, в которой есть поле пароля, и переносим все её input'ы как
+    есть (вместе со скрытым токеном), подставляя логин и пароль. Так бот не
+    зависит от конкретных имён `loginname`/`loginpassword` и от `_csrf`.
+    """
+    for form in re.finditer(r"<form\b[^>]*>(.*?)</form>", body, re.S | re.I):
+        inner = form.group(1)
+        if not re.search(r"""type\s*=\s*["']password""", inner, re.I):
+            continue
+        opening = form.group(0)[: form.group(0).find(">") + 1]
+        action = _fa_raw_attr(opening, "action") or "/login"
+        target = urllib.parse.urljoin("https://www.furaffinity.net/login", action)
+
+        fields: dict[str, str] = {}
+        user_field = pass_field = ""
+        for inp in re.findall(r"<input\b[^>]*>", inner, re.I):
+            name = _fa_raw_attr(inp, "name")
+            if not name:
+                continue
+            kind = (_fa_raw_attr(inp, "type") or "text").lower()
+            value = _fa_raw_attr(inp, "value")
+            if kind == "password":
+                pass_field = name
+            elif kind in {"text", "email", "tel"} and not user_field:
+                user_field = name
+                fields[name] = FA_LOGIN
+            elif kind in {"submit", "button", "file", "reset", "image"}:
+                continue
+            elif kind == "checkbox":
+                if "checked" in inp.lower():
+                    fields[name] = value or "1"
+            elif value:
+                fields[name] = value
+
+        if not pass_field:
+            continue
+        if not user_field:
+            user_field = "loginname"
+            fields[user_field] = FA_LOGIN
+        fields[pass_field] = FA_PASSWORD
+        return target, fields, f"поля {user_field}/{pass_field}, всего {len(fields)}"
+    return "", {}, "нет формы с полем пароля"
+
+
+def _fa_login(force: bool = False) -> tuple[bool, str]:
+    """Вход в аккаунт: без него FA не показывает работы 18+.
+
+    Возвращает (успех, пояснение) — пояснение уходит в сообщение об ошибке,
+    чтобы было видно, на каком шаге всё сломалось.
+    """
     if not FA_LOGIN or not FA_PASSWORD:
-        log.info("FurAffinity: логин не задан, 18+ недоступны")
-        return False
+        return False, "FA_LOGIN/FA_PASSWORD не заданы"
+
     with _FA_LOCK:
-        if _FA_STATE["logged"]:
-            return True
+        if _FA_STATE["logged"] and not force:
+            return True, "сессия уже открыта"
         now = time.monotonic()
-        if now - _FA_STATE["last_try"] < _FA_LOGIN_COOLDOWN:
-            return False
+        if not force and now - _FA_STATE["last_try"] < _FA_LOGIN_COOLDOWN:
+            return False, "прошлая попытка была недавно, жду 10 минут"
         _FA_STATE["last_try"] = now
 
     try:
         page = _fa_get("https://www.furaffinity.net/login")
     except Exception as exc:  # noqa: BLE001
         log.warning("FurAffinity: страница входа не открылась: %s", exc)
-        return False
+        return False, f"страница входа: {type(exc).__name__}: {str(exc)[:90]}"
 
-    token = re.search(r'name="_csrf"[^>]*value="([^"]+)"', page) or re.search(
-        r'value="([^"]+)"[^>]*name="_csrf"', page
-    )
-    form = {
-        "loginname": FA_LOGIN,
-        "loginpassword": FA_PASSWORD,
-        "remember_me": "1",
-        "submit": "Login",
-    }
-    if token:
-        form["_csrf"] = token.group(1)
+    target, fields, note = _fa_login_payload(page)
+    if not fields:
+        return False, f"форма входа не найдена ({note})"
 
     try:
-        body = _fa_post(
-            "https://www.furaffinity.net/login", urllib.parse.urlencode(form).encode()
-        )
+        body = _fa_post(target, urllib.parse.urlencode(fields).encode())
     except Exception as exc:  # noqa: BLE001
         log.warning("FurAffinity: вход не удался (%s): %s", type(exc).__name__, exc)
-        return False
+        return False, f"POST {target}: {type(exc).__name__}: {str(exc)[:90]}"
 
-    logged = "/logout" in body or "Log Out" in body
+    logged = "/logout" in body.lower() or "log out" in body.lower()
     with _FA_LOCK:
         _FA_STATE["logged"] = logged
     if logged:
-        log.info("FurAffinity: вошли как %s", FA_LOGIN)
-    else:
-        log.warning("FurAffinity: FA не принял логин %s (в ответе нет /logout)", FA_LOGIN)
-    return logged
+        log.info("FurAffinity: вошли как %s (%s)", FA_LOGIN, note)
+        return True, f"вошли как {FA_LOGIN} ({note})"
+
+    hint = ""
+    if re.search(r"invalid|incorrect|wrong password|try again", body, re.I):
+        hint = ", в ответе ошибка входа"
+    elif "just a moment" in body[:4000].lower():
+        hint = ", POST упёрся в Cloudflare"
+    log.warning("FurAffinity: FA не принял логин %s (в ответе нет /logout) %s", FA_LOGIN, hint)
+    return False, f"FA не принял вход ({note}{hint})"
 
 
 def _fa_page_meta(body: str) -> tuple[str, str, str] | None:
@@ -1853,20 +1907,33 @@ def _fa_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, 
             )
         sub_id = match.group(1)
         found = _fa_fetch_page(sub_id)
+        login_note = ""
         if not (found and found[0]) and _FA_STATE["logged"]:
             # думали, что сессия живая, а картинки нет — возможно, она протухла
             log.info("FurAffinity: сессия не дала картинку, вхожу заново")
             with _FA_LOCK:
                 _FA_STATE["logged"] = False
                 _FA_STATE["last_try"] = 0.0
-        if not (found and found[0]) and _fa_login():
-            log.info("FurAffinity: открываю работу под аккаунтом %s", FA_LOGIN)
-            found = _fa_fetch_page(sub_id) or found
+        if not (found and found[0]):
+            ok, login_note = _fa_login()
+            if ok:
+                log.info("FurAffinity: открываю работу под аккаунтом %s", FA_LOGIN)
+                found = _fa_fetch_page(sub_id) or found
         if not found:
             raise DownloadError(FA_BLOCKED)
         image, title, author = found
         if not image:
-            raise DownloadError(FA_MATURE)
+            if _FA_STATE["logged"]:
+                message = (
+                    "FurAffinity не отдал картинку: вход выполнен, но работа 18+ "
+                    "всё равно скрыта.\nВключите в настройках аккаунта показ "
+                    "взрослого контента (Settings → Show Mature Content)."
+                )
+            else:
+                message = FA_MATURE
+            if login_note:
+                message += f"\nВход: {login_note}"
+            raise DownloadError(message)
 
     try:
         data = _dns_retry(lambda: _fa_download(image))
@@ -1895,6 +1962,107 @@ def _fa_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, 
         "uploader": author,
         "duration": 0,
     }
+
+
+def _fa_cookie_names() -> str:
+    jar = _FA_STATE.get("jar")
+    if not jar:
+        return "—"
+    names = sorted({cookie.name for cookie in jar})
+    return ", ".join(names) if names else "пусто"
+
+
+def _fa_diagnose_sync(url: str) -> str:
+    """Отчёт о том, что FurAffinity реально отдаёт серверу (для /fa_debug)."""
+    match = FA_VIEW_RE.search(url)
+    if not match:
+        return "Это не ссылка на работу FurAffinity. Нужен вид /view/<id>/."
+    sub_id = match.group(1)
+    direct = f"https://www.furaffinity.net/view/{sub_id}/"
+
+    lines = [
+        f"URL: {direct}",
+        f"Логин: {FA_LOGIN or '—'} | FA_COOKIE: {'задан' if FA_COOKIE else 'нет'}",
+    ]
+
+    body = ""
+    for label, user_agent in (
+        ("браузерный UA", FA_UA),
+        ("TelegramBot", "TelegramBot (like TwitterBot)"),
+    ):
+        try:
+            body = _fa_get(direct, user_agent)
+            lines.append(f"Страница ({label}): {len(body)} байт")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"Страница ({label}): {type(exc).__name__}: {str(exc)[:110]}")
+            continue
+        if body:
+            break
+
+    if not body:
+        lines.append("Итог: страница не открылась — Cloudflare режет сервер.")
+        return "\n".join(lines)
+
+    low = body[:4000].lower()
+    challenged = "just a moment" in low or "attention required" in low
+    lines.append(f"Cloudflare-челлендж: {'ДА' if challenged else 'нет'}")
+    lines.append(f"#submissionImg: {'есть' if 'submissionimg' in body.lower() else 'НЕТ'}")
+    og = _meta_value(body, "og:image")
+    if og:
+        kind = "арт" if _fa_is_art(og) else "не арт (логотип/оформление)"
+        lines.append(f"og:image: {og[:110]} [{kind}]")
+    else:
+        lines.append("og:image: —")
+    marks = [mark for mark in ("mature", "adult", "18+", "restricted") if mark in body.lower()]
+    lines.append(f"Маркеры 18+: {', '.join(marks) if marks else 'нет'}")
+    title, author = _fa_title_author(body)
+    lines.append(f"Название: {title or '—'} | автор: {author or '—'}")
+    lines.append(f"Cookies сессии: {_fa_cookie_names()}")
+
+    try:
+        login_page = _fa_get("https://www.furaffinity.net/login")
+        target, fields, note = _fa_login_payload(login_page)
+        lines.append(f"Страница входа: {len(login_page)} байт, форма: {note}")
+        if target:
+            lines.append(f"Куда POST: {target}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"Страница входа: {type(exc).__name__}: {str(exc)[:110]}")
+
+    with _FA_LOCK:
+        _FA_STATE["logged"] = False
+        _FA_STATE["last_try"] = 0.0
+    ok, note = _fa_login(force=True)
+    lines.append(f"Вход: {'OK' if ok else 'НЕТ'} — {note}")
+    lines.append(f"Cookies после входа: {_fa_cookie_names()}")
+
+    final_image = ""
+    if ok:
+        try:
+            fresh = _fa_get(direct)
+            lines.append(
+                f"После входа: {len(fresh)} байт, "
+                f"#submissionImg {'есть' if 'submissionimg' in fresh.lower() else 'НЕТ'}"
+            )
+            final_image = _fa_page_image(fresh)
+            lines.append(f"Картинка: {final_image or 'НЕ найдена'}")
+            found = sorted(
+                {
+                    item
+                    for item in re.findall(r"https?://[^\s\"'<>]+", fresh)
+                    if FA_FILE_RE.match(item) and _fa_is_art(item)
+                }
+            )
+            if found:
+                lines.append("Арт-ссылки на странице: " + ", ".join(found[:3]))
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"После входа: {type(exc).__name__}: {str(exc)[:110]}")
+
+    lines.append("Итог: картинка " + ("найдена" if final_image else "не найдена"))
+    return "\n".join(lines)
+
+
+async def fa_diagnose(url: str) -> str:
+    return await asyncio.to_thread(_fa_diagnose_sync, url)
 
 
 def _download_media_sync(

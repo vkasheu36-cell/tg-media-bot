@@ -38,6 +38,7 @@ from downloader import (
     YOUTUBE_DISABLED,
     download_audio,
     download_media,
+    fa_diagnose,
     is_music_link,
     is_youtube,
     resolve_music_link_detailed,
@@ -379,6 +380,33 @@ async def cmd_start(message: Message) -> None:
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT)
+
+
+@router.message(Command("fa_debug"))
+async def cmd_fa_debug(message: Message) -> None:
+    """Диагностика FurAffinity: что серверу отдаёт Cloudflare и как прошёл вход."""
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or "furaffinity" not in parts[1].lower():
+        await message.answer(
+            "Пришлите ссылку на работу:\n"
+            "<code>/fa_debug https://www.furaffinity.net/view/123456/</code>"
+        )
+        return
+    status = await message.answer("🔎 Проверяю FurAffinity…")
+    try:
+        report = await asyncio.wait_for(fa_diagnose(parts[1].strip()), timeout=150)
+    except asyncio.TimeoutError:
+        report = "Не успел: FurAffinity отвечал дольше 150 секунд."
+    except Exception as exc:  # noqa: BLE001
+        report = f"{type(exc).__name__}: {exc}"
+    text = html.escape(report)
+    if len(text) > 3900:
+        text = text[:3900] + "…"
+    body = f"<pre>{text}</pre>"
+    try:
+        await status.edit_text(body)
+    except Exception:  # noqa: BLE001
+        await message.answer(body)
 
 
 def _start_kb() -> InlineKeyboardMarkup:

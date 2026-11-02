@@ -9,6 +9,7 @@ import logging
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -21,6 +22,9 @@ import yt_dlp
 
 from config import (
     COOKIES_FILE,
+    FA_COOKIE,
+    FA_LOGIN,
+    FA_PASSWORD,
     FFMPEG_DIR,
     MAX_UPLOAD_MB,
     POT_SERVER,
@@ -1568,11 +1572,11 @@ def _x_media_sync(url: str, out_dir: Path) -> tuple[Path, dict] | None:
 
 
 # ---------------------------------------------------------------- FurAffinity
-# www.furaffinity.net держит все страницы и файлы за Cloudflare: с серверных
-# IP он отвечает «Just a moment…» (JS-челлендж), поэтому обычный запрос не
-# проходит. Перебираем несколько путей: сама страница (браузерный UA и
-# «ботовый»), прокси Google- и Microsoft-переводчика, веб-архив, сторонний
-# API FAExport. Если хоть один отдал HTML — вытаскиваем ссылку на картинку.
+# www.furaffinity.net держит всё за Cloudflare. Обычные работы он с серверного
+# IP ещё отдаёт, а 18+ — только после входа: без сессии вместо картинки в
+# HTML остаётся логотип сайта. Поэтому бот логинится сам (FA_LOGIN/FA_PASSWORD)
+# и только потом ищет картинку. Если Cloudflare не пустил вообще — перебираем
+# обходные пути: «ботовый» UA, прокси Google и Microsoft, веб-архив, FAExport.
 FA_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -1585,10 +1589,25 @@ FA_FILE_RE = re.compile(
     r"\.(?:jpe?g|png|gif|webp)",
     re.I,
 )
+# Картинки работ лежат на d./t. (старые — d2./t2.facdn.net), а логотип и
+# оформление — на www./static.: их принимать нельзя, иначе вместо работы
+# уходит логотип FurAffinity.
+FA_ART_HOSTS = ("d.", "t.", "d2.", "t2.")
+FA_STATIC_MARKS = ("/themes/", "/img/", "/css/", "/js/")
+
 FA_BLOCKED = (
-    "FurAffinity закрыт Cloudflare: с серверного IP страница не открывается.\n"
-    "Пришлите прямую ссылку на картинку (d.furaffinity.net/…) — её скачаю."
+    "FurAffinity не открылся: Cloudflare не пускает сервер.\n"
+    "Пришлите прямую ссылку на картинку (d.furaffinity.net/…)."
 )
+FA_MATURE = (
+    "FurAffinity не отдал картинку: работа помечена 18+, а такие он "
+    "показывает только после входа в аккаунт.\n"
+    "Вход настроен неверно — проверьте FA_LOGIN и FA_PASSWORD."
+)
+
+_FA_LOCK = threading.Lock()
+_FA_STATE: dict = {"opener": None, "logged": False, "last_try": 0.0}
+_FA_LOGIN_COOLDOWN = 600.0  # не долбим FA логином чаще раза в 10 минут
 
 
 def _is_fa(url: str) -> bool:
@@ -1596,9 +1615,15 @@ def _is_fa(url: str) -> bool:
     return host.endswith(("furaffinity.net", "facdn.net"))
 
 
-def is_furaffinity(url: str) -> bool:
-    """FurAffinity: картинки, которые с серверного IP отдаёт только Telegram."""
-    return _is_fa(url)
+def _fa_is_art(url: str) -> bool:
+    """Ссылка на файл работы, а не на логотип/оформление сайта."""
+    parts = urlsplit(url)
+    host = parts.netloc.lower()
+    if not host.endswith((".furaffinity.net", ".facdn.net")):
+        return False
+    if not host.startswith(FA_ART_HOSTS):
+        return False
+    return not any(mark in parts.path.lower() for mark in FA_STATIC_MARKS)
 
 
 def _fa_attr(tag: str, *names: str) -> str:
@@ -1625,10 +1650,10 @@ def _fa_page_image(body: str) -> str:
         candidates.append(_fa_attr(tag, "data-fullview-src", "data-src", "src"))
     candidates.append(_meta_value(body, "og:image"))
 
-    files = [url for url in candidates if url and FA_FILE_RE.match(url)]
+    files = [url for url in candidates if url and FA_FILE_RE.match(url) and _fa_is_art(url)]
     for url in files:
         # t.furaffinity.net — превью 800 px, d. — оригинал: сначала оригинал
-        if not urlsplit(url).netloc.lower().startswith("t."):
+        if not urlsplit(url).netloc.lower().startswith("t"):
             return url
     return files[0] if files else ""
 
@@ -1649,6 +1674,107 @@ def _fa_title_author(body: str) -> tuple[str, str]:
     return title.strip().strip('"'), author.strip()
 
 
+def _fa_headers(ua: str = FA_UA, **extra: str) -> dict[str, str]:
+    headers = {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"}
+    if FA_COOKIE:
+        headers["Cookie"] = FA_COOKIE
+    headers.update(extra)
+    return headers
+
+
+def _fa_opener():
+    """Один opener на процесс: он и хранит cookies сессии FurAffinity."""
+    with _FA_LOCK:
+        if _FA_STATE["opener"] is None:
+            _FA_STATE["opener"] = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+            )
+        return _FA_STATE["opener"]
+
+
+def _fa_get(url: str, ua: str = FA_UA, timeout: float = 25, **extra) -> str:
+    request = urllib.request.Request(url, headers=_fa_headers(ua, **extra))
+    with _fa_opener().open(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", "replace")
+
+
+def _fa_post(url: str, data: bytes, ua: str = FA_UA, timeout: float = 30) -> str:
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers=_fa_headers(
+            ua,
+            **{
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": "https://www.furaffinity.net/login",
+                "Origin": "https://www.furaffinity.net",
+            },
+        ),
+    )
+    with _fa_opener().open(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", "replace")
+
+
+def _fa_login() -> bool:
+    """Вход в аккаунт: без него FA не показывает работы 18+."""
+    if not FA_LOGIN or not FA_PASSWORD:
+        log.info("FurAffinity: логин не задан, 18+ недоступны")
+        return False
+    with _FA_LOCK:
+        if _FA_STATE["logged"]:
+            return True
+        now = time.monotonic()
+        if now - _FA_STATE["last_try"] < _FA_LOGIN_COOLDOWN:
+            return False
+        _FA_STATE["last_try"] = now
+
+    try:
+        page = _fa_get("https://www.furaffinity.net/login")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("FurAffinity: страница входа не открылась: %s", exc)
+        return False
+
+    token = re.search(r'name="_csrf"[^>]*value="([^"]+)"', page) or re.search(
+        r'value="([^"]+)"[^>]*name="_csrf"', page
+    )
+    form = {
+        "loginname": FA_LOGIN,
+        "loginpassword": FA_PASSWORD,
+        "remember_me": "1",
+        "submit": "Login",
+    }
+    if token:
+        form["_csrf"] = token.group(1)
+
+    try:
+        body = _fa_post(
+            "https://www.furaffinity.net/login", urllib.parse.urlencode(form).encode()
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("FurAffinity: вход не удался (%s): %s", type(exc).__name__, exc)
+        return False
+
+    logged = "/logout" in body or "Log Out" in body
+    with _FA_LOCK:
+        _FA_STATE["logged"] = logged
+    if logged:
+        log.info("FurAffinity: вошли как %s", FA_LOGIN)
+    else:
+        log.warning("FurAffinity: FA не принял логин %s (в ответе нет /logout)", FA_LOGIN)
+    return logged
+
+
+def _fa_page_meta(body: str) -> tuple[str, str, str] | None:
+    """Разбор страницы submission; None — это не она (челлендж Cloudflare)."""
+    head = body[:4000].lower()
+    if "just a moment" in head or "attention required" in head:
+        return None
+    if "fur affinity" not in body[:30000].lower():
+        return None
+    title, author = _fa_title_author(body)
+    return _fa_page_image(body), title, author
+
+
 def _fa_fetch_page(sub_id: str) -> tuple[str, str, str] | None:
     """Ищем страницу submission там, где Cloudflare её ещё отдаёт."""
     direct = f"https://www.furaffinity.net/view/{sub_id}/"
@@ -1665,29 +1791,32 @@ def _fa_fetch_page(sub_id: str) -> tuple[str, str, str] | None:
         (f"https://web.archive.org/web/2025/{direct}", FA_UA),
     )
 
+    partial: tuple[str, str, str] | None = None
     for source, user_agent in sources:
         try:
-            body = _fetch_text(
-                source, user_agent, timeout=25, headers={"Accept-Language": "en-US,en;q=0.9"}
-            )
+            body = _fa_get(source, user_agent)
         except Exception as exc:  # noqa: BLE001
             log.debug("FurAffinity: %s не открылся: %s", source[:70], exc)
             continue
-        image = _fa_page_image(body)
-        if image:
+        meta = _fa_page_meta(body)
+        if meta is None:
+            log.debug("FurAffinity: %s — не страница работы", source[:70])
+            continue
+        if meta[0]:
             log.info("FurAffinity: картинка найдена через %s", source[:70])
-            title, author = _fa_title_author(body)
-            return image, title, author
+            return meta
+        # страница открылась, но картинки нет — обычно это 18+ без входа
+        if partial is None:
+            partial = meta
         log.debug("FurAffinity: на %s картинки нет (%s байт)", source[:70], len(body))
 
     # FAExport — сторонний API поверх FurAffinity (тот же Cloudflare, но свой IP)
     try:
         data = json.loads(
-            _fetch_text(
+            _fa_get(
                 f"https://faexport.spangle.org.uk/submission/{sub_id}.json",
-                FA_UA,
                 timeout=20,
-                headers={"Accept": "application/json"},
+                **{"Accept": "application/json"},
             )
         )
         image = str(data.get("file_url") or "").strip()
@@ -1696,26 +1825,24 @@ def _fa_fetch_page(sub_id: str) -> tuple[str, str, str] | None:
             return image, str(data.get("title") or ""), str(data.get("author") or "")
     except Exception as exc:  # noqa: BLE001
         log.debug("FurAffinity: FAExport не ответил: %s", exc)
-    return None
+    return partial
 
 
 def _fa_download(image_url: str) -> bytes:
     """Файл с CDN: без Referer и браузерных заголовков Cloudflare режет."""
     request = urllib.request.Request(
         image_url,
-        headers={
-            "User-Agent": FA_UA,
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.furaffinity.net/",
-        },
+        headers=_fa_headers(
+            Accept="image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            Referer="https://www.furaffinity.net/",
+        ),
     )
-    with urllib.request.urlopen(request, timeout=90) as response:
+    with _fa_opener().open(request, timeout=90) as response:
         return response.read()
 
 
 def _fa_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, dict]:
-    if FA_FILE_RE.match(url):
+    if _fa_is_art(url):
         image, title, author = url, "", ""
     else:
         match = FA_VIEW_RE.search(url)
@@ -1724,10 +1851,22 @@ def _fa_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, 
                 "Это FurAffinity, но не ссылка на картинку.\n"
                 "Пришлите ссылку вида www.furaffinity.net/view/12345678/"
             )
-        found = _fa_fetch_page(match.group(1))
+        sub_id = match.group(1)
+        found = _fa_fetch_page(sub_id)
+        if not (found and found[0]) and _FA_STATE["logged"]:
+            # думали, что сессия живая, а картинки нет — возможно, она протухла
+            log.info("FurAffinity: сессия не дала картинку, вхожу заново")
+            with _FA_LOCK:
+                _FA_STATE["logged"] = False
+                _FA_STATE["last_try"] = 0.0
+        if not (found and found[0]) and _fa_login():
+            log.info("FurAffinity: открываю работу под аккаунтом %s", FA_LOGIN)
+            found = _fa_fetch_page(sub_id) or found
         if not found:
             raise DownloadError(FA_BLOCKED)
         image, title, author = found
+        if not image:
+            raise DownloadError(FA_MATURE)
 
     try:
         data = _dns_retry(lambda: _fa_download(image))

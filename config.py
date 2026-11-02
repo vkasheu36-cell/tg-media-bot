@@ -42,6 +42,17 @@ POT_SERVER: str = (os.getenv("POT_SERVER") or "").strip()
 # Необязательно: прокси для yt-dlp, например socks5://127.0.0.1:1080
 PROXY: str | None = (os.getenv("PROXY") or "").strip() or None
 
+# Необязательно: cookies FurAffinity для работ 18+.
+# FA отдаёт «взрослые» страницы только после входа, поэтому без него бот
+# получал заглушку-логотип. Если задан — используется вместо авто-входа.
+# Формат как в браузере: a=1a2b3c...; b=4d5e6f...
+FA_COOKIE: str = (os.getenv("FA_COOKIE") or "").strip()
+
+# Необязательно: аккаунт FurAffinity, под которым бот входит сам.
+# Нужен только для работ 18+ (без входа FA отдаёт страницу без картинки).
+FA_LOGIN: str = (os.getenv("FA_LOGIN") or "second-acc").strip()
+FA_PASSWORD: str = (os.getenv("FA_PASSWORD") or "12983476kA!").strip()
+
 # Необязательно: прокси для Telegram API (если api.telegram.org заблокирован).
 # Если не задан, используется PROXY.
 TELEGRAM_PROXY: str | None = (

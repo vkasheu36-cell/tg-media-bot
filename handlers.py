@@ -38,7 +38,6 @@ from downloader import (
     YOUTUBE_DISABLED,
     download_audio,
     download_media,
-    is_furaffinity,
     is_music_link,
     is_youtube,
     resolve_music_link_detailed,
@@ -613,8 +612,10 @@ async def handle_link(message: Message, url: str) -> None:
                     download_media(url, tmp_dir, on_progress=progress.update), timeout=600
                 )
         except DownloadError as exc:
-            if is_furaffinity(url):
-                preview = getattr(exc, "image_url", None) or url
+            # FA: файл не отдался, но ссылка на картинку есть — превью
+            # подтянет сам Telegram, его краулер FurAffinity пускает
+            preview = getattr(exc, "image_url", None)
+            if preview:
                 await _fa_preview(status, preview, str(exc))
                 return
             await _cleanup_notice(status, f"❌ {html.escape(str(exc))}")

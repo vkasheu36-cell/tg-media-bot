@@ -1674,10 +1674,26 @@ def _fa_title_author(body: str) -> tuple[str, str]:
     return title.strip().strip('"'), author.strip()
 
 
+def _fa_cookie_header() -> str:
+    """FA_COOKIE в виде заголовка: переносы строк и лишние `;` не мешают."""
+    if not FA_COOKIE:
+        return ""
+    parts = [part.strip() for part in re.split(r"[;\n\r]+", FA_COOKIE) if part.strip()]
+    return "; ".join(parts)
+
+
 def _fa_headers(ua: str = FA_UA, **extra: str) -> dict[str, str]:
-    headers = {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"}
-    if FA_COOKIE:
-        headers["Cookie"] = FA_COOKIE
+    headers = {
+        "User-Agent": ua,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    cookie = _fa_cookie_header()
+    if cookie:
+        headers["Cookie"] = cookie
     headers.update(extra)
     return headers
 
@@ -1708,8 +1724,17 @@ def _fa_post(url: str, data: bytes, ua: str = FA_UA, timeout: float = 30) -> str
             ua,
             **{
                 "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": "https://www.furaffinity.net/login",
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,*/*;q=0.8"
+                ),
+                "Referer": "https://www.furaffinity.net/login/",
                 "Origin": "https://www.furaffinity.net",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-User": "?1",
             },
         ),
     )
@@ -1739,6 +1764,7 @@ def _fa_login_payload(body: str) -> tuple[str, dict[str, str], str]:
         target = urllib.parse.urljoin("https://www.furaffinity.net/login", action)
 
         fields: dict[str, str] = {}
+        seen: list[str] = []
         user_field = pass_field = ""
         for inp in re.findall(r"<input\b[^>]*>", inner, re.I):
             name = _fa_raw_attr(inp, "name")
@@ -1758,6 +1784,7 @@ def _fa_login_payload(body: str) -> tuple[str, dict[str, str], str]:
                     fields[name] = value or "1"
             elif value:
                 fields[name] = value
+            seen.append(f"{name}:{kind}")
 
         if not pass_field:
             continue
@@ -1765,8 +1792,29 @@ def _fa_login_payload(body: str) -> tuple[str, dict[str, str], str]:
             user_field = "loginname"
             fields[user_field] = FA_LOGIN
         fields[pass_field] = FA_PASSWORD
-        return target, fields, f"поля {user_field}/{pass_field}, всего {len(fields)}"
+        return target, fields, f"поля {', '.join(seen)} (всего {len(fields)})"
     return "", {}, "нет формы с полем пароля"
+
+
+def _fa_http_detail(exc: Exception) -> str:
+    """Короткое описание HTTP-ошибки: статус, важные заголовки и начало тела."""
+    parts = [f"{type(exc).__name__}: {exc}"]
+    headers = getattr(exc, "headers", None)
+    if headers:
+        for key in ("Server", "CF-Mitigated", "Retry-After", "Location"):
+            value = headers.get(key)
+            if value:
+                parts.append(f"{key}={value}")
+    try:
+        raw = exc.read()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        raw = b""
+    if raw:
+        text = re.sub(r"<[^>]+>", " ", raw.decode("utf-8", "replace"))
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            parts.append("тело: " + text[:160])
+    return " | ".join(parts)
 
 
 def _fa_login(force: bool = False) -> tuple[bool, str]:
@@ -1796,11 +1844,30 @@ def _fa_login(force: bool = False) -> tuple[bool, str]:
     if not fields:
         return False, f"форма входа не найдена ({note})"
 
-    try:
-        body = _fa_post(target, urllib.parse.urlencode(fields).encode())
-    except Exception as exc:  # noqa: BLE001
-        log.warning("FurAffinity: вход не удался (%s): %s", type(exc).__name__, exc)
-        return False, f"POST {target}: {type(exc).__name__}: {str(exc)[:90]}"
+    # FA иногда отвечает 503 на POST со слэшем: пробуем и вариант без него
+    attempts = [target]
+    if target.endswith("/"):
+        attempts.append(target.rstrip("/"))
+
+    body = ""
+    detail = ""
+    for attempt in attempts:
+        try:
+            body = _fa_post(attempt, urllib.parse.urlencode(fields).encode())
+            detail = ""
+            break
+        except urllib.error.HTTPError as exc:
+            detail = _fa_http_detail(exc)
+            log.warning("FurAffinity: POST %s -> %s", attempt, detail)
+            if exc.code not in (403, 503):
+                break
+        except Exception as exc:  # noqa: BLE001
+            detail = f"{type(exc).__name__}: {str(exc)[:120]}"
+            log.warning("FurAffinity: POST %s -> %s", attempt, detail)
+            break
+
+    if detail:
+        return False, f"POST {attempts[0]}: {detail}"
 
     logged = "/logout" in body.lower() or "log out" in body.lower()
     with _FA_LOCK:
@@ -1933,6 +2000,11 @@ def _fa_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, 
                 message = FA_MATURE
             if login_note:
                 message += f"\nВход: {login_note}"
+            if "503" in login_note:
+                message += (
+                    "\nFA блокирует сам вход с сервера — задайте на Render "
+                    "переменную FA_COOKIE (cookies a и b из браузера)."
+                )
             raise DownloadError(message)
 
     try:
@@ -2018,6 +2090,25 @@ def _fa_diagnose_sync(url: str) -> str:
     title, author = _fa_title_author(body)
     lines.append(f"Название: {title or '—'} | автор: {author or '—'}")
     lines.append(f"Cookies сессии: {_fa_cookie_names()}")
+    jar = _FA_STATE.get("jar")
+    has_a = any(cookie.name == "a" for cookie in jar) if jar else False
+    lines.append(f"Cookie a (признак входа): {'есть' if has_a else 'НЕТ'}")
+
+    try:
+        export = json.loads(
+            _fa_get(
+                f"https://faexport.spangle.org.uk/submission/{sub_id}.json",
+                timeout=20,
+                **{"Accept": "application/json"},
+            )
+        )
+        file_url = str(export.get("file_url") or "").strip()
+        if file_url:
+            lines.append(f"FAExport: {file_url[:110]} [{'арт' if _fa_is_art(file_url) else 'не арт'}]")
+        else:
+            lines.append("FAExport: ответ без file_url")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAExport: {type(exc).__name__}: {str(exc)[:110]}")
 
     try:
         login_page = _fa_get("https://www.furaffinity.net/login")

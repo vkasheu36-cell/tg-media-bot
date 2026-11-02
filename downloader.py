@@ -1823,6 +1823,11 @@ def _fa_login(force: bool = False) -> tuple[bool, str]:
     Возвращает (успех, пояснение) — пояснение уходит в сообщение об ошибке,
     чтобы было видно, на каком шаге всё сломалось.
     """
+    if _fa_cookie_header():
+        return False, (
+            "задан FA_COOKIE, вход по паролю не нужен; если работа не "
+            "открылась — cookies протухли, обновите a и b"
+        )
     if not FA_LOGIN or not FA_PASSWORD:
         return False, "FA_LOGIN/FA_PASSWORD не заданы"
 
@@ -1996,9 +2001,14 @@ def _fa_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, 
                     "всё равно скрыта.\nВключите в настройках аккаунта показ "
                     "взрослого контента (Settings → Show Mature Content)."
                 )
+            elif _fa_cookie_header():
+                message = (
+                    "FurAffinity не отдал картинку: cookies FA_COOKIE не сработали.\n"
+                    "Войдите в FA в браузере и обновите cookies a и b."
+                )
             else:
                 message = FA_MATURE
-            if login_note:
+            if login_note and not _fa_cookie_header():
                 message += f"\nВход: {login_note}"
             if "503" in login_note:
                 message += (
@@ -2089,10 +2099,19 @@ def _fa_diagnose_sync(url: str) -> str:
     lines.append(f"Маркеры 18+: {', '.join(marks) if marks else 'нет'}")
     title, author = _fa_title_author(body)
     lines.append(f"Название: {title or '—'} | автор: {author or '—'}")
-    lines.append(f"Cookies сессии: {_fa_cookie_names()}")
+    cookie_src = _fa_cookie_header()
+    if cookie_src:
+        names = [part.split("=", 1)[0].strip() for part in cookie_src.split(";") if "=" in part]
+        lines.append("FA_COOKIE: " + ", ".join(names))
     jar = _FA_STATE.get("jar")
-    has_a = any(cookie.name == "a" for cookie in jar) if jar else False
+    jar_names = {cookie.name for cookie in jar} if jar else set()
+    lines.append(f"Cookies из ответов FA: {_fa_cookie_names()}")
+    has_a = "a" in jar_names or any(part.strip().startswith("a=") for part in cookie_src.split(";"))
     lines.append(f"Cookie a (признак входа): {'есть' if has_a else 'НЕТ'}")
+
+    early_image = _fa_page_image(body)
+    if early_image:
+        lines.append(f"Картинка сразу: {early_image[:110]}")
 
     try:
         export = json.loads(
@@ -2110,31 +2129,35 @@ def _fa_diagnose_sync(url: str) -> str:
     except Exception as exc:  # noqa: BLE001
         lines.append(f"FAExport: {type(exc).__name__}: {str(exc)[:110]}")
 
-    try:
-        login_page = _fa_get("https://www.furaffinity.net/login")
-        target, fields, note = _fa_login_payload(login_page)
-        lines.append(f"Страница входа: {len(login_page)} байт, форма: {note}")
-        if target:
-            lines.append(f"Куда POST: {target}")
-    except Exception as exc:  # noqa: BLE001
-        lines.append(f"Страница входа: {type(exc).__name__}: {str(exc)[:110]}")
+    if cookie_src:
+        lines.append("Вход по паролю: пропущен — используется FA_COOKIE")
+        ok = False
+    else:
+        try:
+            login_page = _fa_get("https://www.furaffinity.net/login")
+            target, fields, note = _fa_login_payload(login_page)
+            lines.append(f"Страница входа: {len(login_page)} байт, форма: {note}")
+            if target:
+                lines.append(f"Куда POST: {target}")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"Страница входа: {type(exc).__name__}: {str(exc)[:110]}")
 
-    with _FA_LOCK:
-        _FA_STATE["logged"] = False
-        _FA_STATE["last_try"] = 0.0
-    ok, note = _fa_login(force=True)
-    lines.append(f"Вход: {'OK' if ok else 'НЕТ'} — {note}")
-    lines.append(f"Cookies после входа: {_fa_cookie_names()}")
+        with _FA_LOCK:
+            _FA_STATE["logged"] = False
+            _FA_STATE["last_try"] = 0.0
+        ok, note = _fa_login(force=True)
+        lines.append(f"Вход: {'OK' if ok else 'НЕТ'} — {note}")
+        lines.append(f"Cookies после входа: {_fa_cookie_names()}")
 
-    final_image = ""
-    if ok:
+    final_image = early_image
+    if ok or (cookie_src and not final_image):
         try:
             fresh = _fa_get(direct)
             lines.append(
-                f"После входа: {len(fresh)} байт, "
+                f"С аккаунтом: {len(fresh)} байт, "
                 f"#submissionImg {'есть' if 'submissionimg' in fresh.lower() else 'НЕТ'}"
             )
-            final_image = _fa_page_image(fresh)
+            final_image = _fa_page_image(fresh) or final_image
             lines.append(f"Картинка: {final_image or 'НЕ найдена'}")
             found = sorted(
                 {
@@ -2145,8 +2168,13 @@ def _fa_diagnose_sync(url: str) -> str:
             )
             if found:
                 lines.append("Арт-ссылки на странице: " + ", ".join(found[:3]))
+            if cookie_src and not final_image:
+                lines.append(
+                    "FA_COOKIE задан, но картинки нет: cookies протухли "
+                    "или в аккаунте выключен показ Mature/Adult."
+                )
         except Exception as exc:  # noqa: BLE001
-            lines.append(f"После входа: {type(exc).__name__}: {str(exc)[:110]}")
+            lines.append(f"С аккаунтом: {type(exc).__name__}: {str(exc)[:110]}")
 
     lines.append("Итог: картинка " + ("найдена" if final_image else "не найдена"))
     return "\n".join(lines)

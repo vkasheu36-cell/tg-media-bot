@@ -23,6 +23,7 @@ from aiogram.types import (
     InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
+    LinkPreviewOptions,
     Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -37,6 +38,7 @@ from downloader import (
     YOUTUBE_DISABLED,
     download_audio,
     download_media,
+    is_furaffinity,
     is_music_link,
     is_youtube,
     resolve_music_link_detailed,
@@ -60,7 +62,7 @@ START_TEXT = (
     "🎵 <b>Музыка</b> — пришли название трека или «исполнитель - название», "
     "я найду варианты и пришлю mp3.\n\n"
     "📥 <b>Медиа по ссылке</b> — кинь ссылку на TikTok, VK, Twitter/X, Instagram, "
-    "Vimeo, Reddit, SoundCloud и многое другое — пришлю файл.\n\n"
+    "Vimeo, Reddit, SoundCloud, FurAffinity и многое другое — пришлю файл.\n\n"
     "💬 <b>В любом чате</b> — набери <code>@имя_бота</code> и ссылку или название трека, "
     "не добавляя меня в чат.\n\n"
     "Лимит Telegram — 50 МБ на файл, поэтому видео автоматически ужимается по качеству."
@@ -71,6 +73,7 @@ HELP_TEXT = (
     "• <code>девочка с дайвинчика</code> — поиск музыки\n"
     "• <code>https://www.tiktok.com/...</code> — скачать видео\n"
     "• <code>https://vk.ru/video...</code> или <code>vk.ru/wall...</code> — видео из VK\n"
+    "• <code>https://www.furaffinity.net/view/12345678/</code> — картинка с FurAffinity\n"
     "• <code>@имя_бота https://tiktok.com/...</code> — прямо в любом чате\n\n"
     "YouTube не поддерживается: с серверного IP он требует вход.\n"
     "Ссылки на посты Telegram не поддерживаются: для них нужен юзербот."
@@ -565,6 +568,26 @@ async def cb_track(callback: CallbackQuery) -> None:
 # ---------------------------------------------------------------- медиа по ссылке
 
 
+async def _fa_preview(status: Message, url: str, detail: str) -> None:
+    """FurAffinity закрыт Cloudflare — просим Telegram показать превью.
+
+    Картинку тянет уже сервер Telegram: его краулер FurAffinity пускает,
+    поэтому пользователь хотя бы видит работу и может её сохранить.
+    """
+    text = f"🖼 {html.escape(detail)}\nПревью ниже подгружает сам Telegram."
+    try:
+        await status.edit_text(
+            text,
+            link_preview_options=LinkPreviewOptions(
+                url=url, prefer_large_media=True, show_above_text=False
+            ),
+        )
+        return
+    except Exception:  # noqa: BLE001
+        log.debug("FurAffinity: превью не отправилось", exc_info=True)
+    await _cleanup_notice(status, text)
+
+
 async def handle_link(message: Message, url: str) -> None:
     if is_youtube(url):
         await message.answer(YOUTUBE_DISABLED)
@@ -590,6 +613,10 @@ async def handle_link(message: Message, url: str) -> None:
                     download_media(url, tmp_dir, on_progress=progress.update), timeout=600
                 )
         except DownloadError as exc:
+            if is_furaffinity(url):
+                preview = getattr(exc, "image_url", None) or url
+                await _fa_preview(status, preview, str(exc))
+                return
             await _cleanup_notice(status, f"❌ {html.escape(str(exc))}")
             return
         except asyncio.TimeoutError:

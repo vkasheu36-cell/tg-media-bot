@@ -155,6 +155,8 @@ _SERVICES = {
     "soundcloud.com": "SoundCloud",
     "hitmoz.org": "Hitmo",
     "zvyki.com": "Zvyki",
+    "furaffinity.net": "FurAffinity",
+    "facdn.net": "FurAffinity",
     "deliciousoranges.com": "Hitmo",
     "spotify.com": "Spotify",
     "music.apple.com": "Apple Music",
@@ -1565,6 +1567,197 @@ def _x_media_sync(url: str, out_dir: Path) -> tuple[Path, dict] | None:
     return None
 
 
+# ---------------------------------------------------------------- FurAffinity
+# www.furaffinity.net держит все страницы и файлы за Cloudflare: с серверных
+# IP он отвечает «Just a moment…» (JS-челлендж), поэтому обычный запрос не
+# проходит. Перебираем несколько путей: сама страница (браузерный UA и
+# «ботовый»), прокси Google- и Microsoft-переводчика, веб-архив, сторонний
+# API FAExport. Если хоть один отдал HTML — вытаскиваем ссылку на картинку.
+FA_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+FA_VIEW_RE = re.compile(
+    r"https?://(?:[\w-]+\.)?furaffinity\.net/(?:view|full|artwork)/(\d+)", re.I
+)
+FA_FILE_RE = re.compile(
+    r"https?://(?:[\w-]+\.)?(?:furaffinity\.net|facdn\.net)/[^\s\"'<>]+?"
+    r"\.(?:jpe?g|png|gif|webp)",
+    re.I,
+)
+FA_BLOCKED = (
+    "FurAffinity закрыт Cloudflare: с серверного IP страница не открывается.\n"
+    "Пришлите прямую ссылку на картинку (d.furaffinity.net/…) — её скачаю."
+)
+
+
+def _is_fa(url: str) -> bool:
+    host = urlsplit(url).netloc.lower()
+    return host.endswith(("furaffinity.net", "facdn.net"))
+
+
+def is_furaffinity(url: str) -> bool:
+    """FurAffinity: картинки, которые с серверного IP отдаёт только Telegram."""
+    return _is_fa(url)
+
+
+def _fa_attr(tag: str, *names: str) -> str:
+    """Значение атрибута из тега: порядок и кавычки бывают любыми."""
+    for name in names:
+        found = re.search(rf'\b{name}\s*=\s*["\']([^"\']+)["\']', tag, re.I)
+        if not found:
+            continue
+        value = html.unescape(found.group(1)).strip().replace("\\/", "/")
+        if value.startswith("//"):
+            value = "https:" + value
+        if value.startswith("http"):
+            return value
+    return ""
+
+
+def _fa_page_image(body: str) -> str:
+    """Ссылка на саму картинку из HTML страницы submission."""
+    candidates: list[str] = []
+    for tag in re.findall(r"<img\b[^>]*>", body, re.I):
+        if "submissionimg" not in tag.lower():
+            continue
+        # data-fullview-src — оригинал, src — превью для страницы
+        candidates.append(_fa_attr(tag, "data-fullview-src", "data-src", "src"))
+    candidates.append(_meta_value(body, "og:image"))
+
+    files = [url for url in candidates if url and FA_FILE_RE.match(url)]
+    for url in files:
+        # t.furaffinity.net — превью 800 px, d. — оригинал: сначала оригинал
+        if not urlsplit(url).netloc.lower().startswith("t."):
+            return url
+    return files[0] if files else ""
+
+
+def _fa_title_author(body: str) -> tuple[str, str]:
+    """«Название» и автор из <title>: `"Title" by artist -- Fur Affinity`."""
+    title = _meta_value(body, "og:title")
+    author = ""
+    found = re.search(r"<title>\s*(.*?)\s*(?:--|—)\s*Fur Affinity", body, re.S | re.I)
+    if found:
+        text = re.sub(r"\s+", " ", found.group(1)).strip()
+        parts = re.split(r"\s+by\s+", text, maxsplit=1)
+        if len(parts) == 2:
+            title = title or parts[0].strip()
+            author = parts[1].strip()
+        elif not title:
+            title = text
+    return title.strip().strip('"'), author.strip()
+
+
+def _fa_fetch_page(sub_id: str) -> tuple[str, str, str] | None:
+    """Ищем страницу submission там, где Cloudflare её ещё отдаёт."""
+    direct = f"https://www.furaffinity.net/view/{sub_id}/"
+    quoted = urllib.parse.quote(direct, safe="")
+    sources = (
+        (direct, FA_UA),
+        (direct, "TelegramBot (like TwitterBot)"),
+        (
+            f"https://www-furaffinity-net.translate.goog/view/{sub_id}/"
+            "?_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en",
+            FA_UA,
+        ),
+        (f"https://www.translatetheweb.com/?from=&to=en&a={quoted}", FA_UA),
+        (f"https://web.archive.org/web/2025/{direct}", FA_UA),
+    )
+
+    for source, user_agent in sources:
+        try:
+            body = _fetch_text(
+                source, user_agent, timeout=25, headers={"Accept-Language": "en-US,en;q=0.9"}
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("FurAffinity: %s не открылся: %s", source[:70], exc)
+            continue
+        image = _fa_page_image(body)
+        if image:
+            log.info("FurAffinity: картинка найдена через %s", source[:70])
+            title, author = _fa_title_author(body)
+            return image, title, author
+        log.debug("FurAffinity: на %s картинки нет (%s байт)", source[:70], len(body))
+
+    # FAExport — сторонний API поверх FurAffinity (тот же Cloudflare, но свой IP)
+    try:
+        data = json.loads(
+            _fetch_text(
+                f"https://faexport.spangle.org.uk/submission/{sub_id}.json",
+                FA_UA,
+                timeout=20,
+                headers={"Accept": "application/json"},
+            )
+        )
+        image = str(data.get("file_url") or "").strip()
+        if image.startswith("http"):
+            log.info("FurAffinity: картинка найдена через FAExport")
+            return image, str(data.get("title") or ""), str(data.get("author") or "")
+    except Exception as exc:  # noqa: BLE001
+        log.debug("FurAffinity: FAExport не ответил: %s", exc)
+    return None
+
+
+def _fa_download(image_url: str) -> bytes:
+    """Файл с CDN: без Referer и браузерных заголовков Cloudflare режет."""
+    request = urllib.request.Request(
+        image_url,
+        headers={
+            "User-Agent": FA_UA,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.furaffinity.net/",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=90) as response:
+        return response.read()
+
+
+def _fa_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, dict]:
+    if FA_FILE_RE.match(url):
+        image, title, author = url, "", ""
+    else:
+        match = FA_VIEW_RE.search(url)
+        if not match:
+            raise DownloadError(
+                "Это FurAffinity, но не ссылка на картинку.\n"
+                "Пришлите ссылку вида www.furaffinity.net/view/12345678/"
+            )
+        found = _fa_fetch_page(match.group(1))
+        if not found:
+            raise DownloadError(FA_BLOCKED)
+        image, title, author = found
+
+    try:
+        data = _dns_retry(lambda: _fa_download(image))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("FurAffinity: файл не скачался (%s): %s", image, exc)
+        error = DownloadError(
+            "FurAffinity не отдал картинку: Cloudflare блокирует серверный IP."
+        )
+        error.image_url = image  # handlers покажет превью силами Telegram
+        raise error from exc
+
+    budget = MAX_UPLOAD_MB * 1024 * 1024
+    if len(data) > budget:
+        raise DownloadError(
+            f"Картинка весит {len(data) / 1024 / 1024:.0f} МБ — "
+            f"больше лимита Telegram ({MAX_UPLOAD_MB} МБ)."
+        )
+
+    ext = _guess_ext(image)
+    if ext not in {".jpg", ".png", ".gif", ".webp"}:
+        ext = ".jpg"
+    path = out_dir / f"fa{ext}"
+    path.write_bytes(data)
+    return path, {
+        "title": title or "FurAffinity",
+        "uploader": author,
+        "duration": 0,
+    }
+
+
 def _download_media_sync(
     url: str, out_dir: Path, on_progress=None
 ) -> tuple[Path, dict]:
@@ -1586,6 +1779,10 @@ def _download_media_sync(
     # Zvyki: тоже свой разбор, отдаёт AAC
     if _is_zvyki(url):
         return _zvyki_from_url_sync(url, out_dir, on_progress)
+
+    # FurAffinity: yt-dlp его не знает, а страницы закрыты Cloudflare
+    if _is_fa(url):
+        return _fa_from_url_sync(url, out_dir, on_progress)
 
     # 1) лёгкий проход без скачивания: узнаём форматы, размеры, метаданные
     def _probe():

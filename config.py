@@ -49,7 +49,7 @@ PROXY: str | None = (os.getenv("PROXY") or "").strip() or None
 # Если сессия протухла: войти в FA в браузере и обновить a и b.
 FA_COOKIE: str = (
     os.getenv("FA_COOKIE")
-    or "a=d4a2cf01-652b-47c7-88fa-95a1285534fd; b=d32858cd-9796-4293-91da-7a2e100922ef"
+    or "a=12eed7f5-3189-4ab6-93ce-32914f148a83; b=dc2f70f8-9616-42fc-9a0b-8d1f7c8a0c6e"
 ).strip()
 
 # Необязательно: аккаунт FurAffinity, под которым бот входит сам.

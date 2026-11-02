@@ -1954,6 +1954,17 @@ def _fa_fetch_page(sub_id: str) -> tuple[str, str, str] | None:
     return partial
 
 
+def _fa_image_ok(data: bytes) -> bool:
+    """Настоящая картинка, а не HTML-заглушка Cloudflare."""
+    if data[:2] == b"\xff\xd8":  # jpeg
+        return True
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return True
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return True
+    return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
 def _fa_download(image_url: str) -> bytes:
     """Файл с CDN: без Referer и браузерных заголовков Cloudflare режет."""
     request = urllib.request.Request(
@@ -2026,6 +2037,19 @@ def _fa_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, 
         )
         error.image_url = image  # handlers покажет превью силами Telegram
         raise error from exc
+
+    if not _fa_image_ok(data):
+        log.warning(
+            "FurAffinity: вместо картинки пришло %s (%s байт): %s",
+            "HTML" if b"<html" in data[:500].lower() else "неизвестный формат",
+            len(data),
+            image,
+        )
+        error = DownloadError(
+            "FurAffinity отдал вместо картинки страницу Cloudflare."
+        )
+        error.image_url = image  # превью подтянет Telegram
+        raise error
 
     budget = MAX_UPLOAD_MB * 1024 * 1024
     if len(data) > budget:

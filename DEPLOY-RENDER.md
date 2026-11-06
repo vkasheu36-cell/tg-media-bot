@@ -24,7 +24,10 @@ Long polling на Render не годится — платформа ждёт о�
    - **Region**: ближайший к вам (например, Frankfurt).
 4. **Environment Variables** → добавить:
    - `BOT_TOKEN` = токен от @BotFather;
-   - `MAX_UPLOAD_MB` = `49` (необязательно).
+   - `MAX_UPLOAD_MB` = `49` (необязательно);
+   - `FA_COOKIE` = `a=…; b=…` для работ FurAffinity 18+ (необязательно);
+   - `COBALT_API` = `https://ваш-cobalt|Api-Key …` для YouTube (необязательно);
+   - `COBALT_SERVICES` = `instagram,reddit,rutube` (необязательно).
 5. **Create Web Service** и подождать 3–5 минут сборки.
 
 В логах должно появиться:
@@ -57,10 +60,27 @@ HTTP-сервер слушает 0.0.0.0:10000
 обновлений. Если локальный бот останется на long polling, Telegram начнёт
 конфликтовать с вебхуком (`409 Conflict`).
 
+## 5. YouTube, Instagram, Reddit, Rutube
+
+Для этих сервисов бот сначала пробует `COBALT_API` (если задан), затем обычный yt-dlp.
+YouTube идёт в cobalt всегда, остальные — из списка `COBALT_SERVICES`
+(по умолчанию `instagram,reddit,rutube`).
+
+Render — датацентр, и YouTube часто просит «Sign in to confirm you're not a bot».
+Иногда yt-dlp проходит и с Render, но стабильнее всего — свой cobalt-инстанс
+с ключом или cookies сервисов.
+
+Важно: публичный `api.cobalt.tools` YouTube **не поддерживает**, а бесплатные
+публичные инстансы требуют токен turnstile (`error.api.auth.jwt.missing`).
+Instagram и Reddit на публичных инстансах часто отвечают «нужен вход».
+Свой cobalt поднимается по инструкции imputnet/cobalt; для YouTube ему нужны
+PO-токены (`YOUTUBE_SESSION_SERVER`) или cookies аккаунта, для Instagram/Reddit —
+cookies этих сервисов в инстансе.
+
 ## Ограничения бесплатного тарифа
 
-- 512 МБ RAM и 0.1 CPU: музыка (Hitmo отдаёт готовые mp3) летает, а вот
-  конвертация видео через ffmpeg будет заметно медленной;
+- 512 МБ RAM и 0.1 CPU: музыка (Hitmo и Zvyki отдают готовые файлы) летает,
+  а вот конвертация видео через ffmpeg будет заметно медленной;
 - 750 часов в месяц на все бесплатные сервисы аккаунта — одного бота
   (≈730 ч) это касается впритык;
 - диск временный: после каждого деплоя кэш `file_id` обнуляется.

@@ -1206,6 +1206,10 @@ YOUTUBE_BOT_CHECK = (
     "Укажите COBALT_API (свой инстанс cobalt) или COOKIES_FILE с cookies YouTube."
 )
 
+# Совместимость со старыми сборками: прежний inline.py ещё импортирует это имя.
+# Актуальный код его не использует — YouTube включён.
+YOUTUBE_DISABLED = YOUTUBE_BOT_CHECK
+
 
 # ---------------------------------------------------------------- cobalt
 # cobold (tskau/cobold) не качает YouTube сам: он отправляет ссылку в cobalt API,

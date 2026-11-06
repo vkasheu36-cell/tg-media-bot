@@ -19,6 +19,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Ранняя проверка: несовместимые файлы (например, старый inline.py рядом с
+# новым downloader.py) валят сборку сразу, а не при запуске на Render.
+RUN python -c "import bot"
+
 # Без PUBLIC_URL бот работает через long polling, с ним — через вебхук
 ENV PUBLIC_URL=""
 EXPOSE 8080

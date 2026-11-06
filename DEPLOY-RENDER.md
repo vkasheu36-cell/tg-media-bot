@@ -26,8 +26,10 @@ Long polling на Render не годится — платформа ждёт о�
    - `BOT_TOKEN` = токен от @BotFather;
    - `MAX_UPLOAD_MB` = `49` (необязательно);
    - `FA_COOKIE` = `a=…; b=…` для работ FurAffinity 18+ (необязательно);
-   - `COBALT_API` = `https://ваш-cobalt|Api-Key …` для YouTube (необязательно);
-   - `COBALT_SERVICES` = `instagram,reddit,rutube` (необязательно).
+   - `COBALT_API` = `https://ваш-cobalt|Api-Key …` для Instagram/Reddit/Rutube (необязательно);
+   - `COBALT_YOUTUBE` = `1` — гнать YouTube через cobalt (по умолчанию `0`: yt-dlp + cookies);
+   - `COBALT_SERVICES` = `instagram,reddit,rutube` (необязательно);
+   - `COOKIES_FILE` = `/etc/secrets/cookies.txt` (Secret File) — для YouTube и Instagram.
 5. **Create Web Service** и подождать 3–5 минут сборки.
 
 В логах должно появиться:
@@ -62,13 +64,14 @@ HTTP-сервер слушает 0.0.0.0:10000
 
 ## 5. YouTube, Instagram, Reddit, Rutube
 
-Для этих сервисов бот сначала пробует `COBALT_API` (если задан), затем обычный yt-dlp.
-YouTube идёт в cobalt всегда, остальные — из списка `COBALT_SERVICES`
-(по умолчанию `instagram,reddit,rutube`).
+YouTube по умолчанию качается напрямую через yt-dlp с cookies из `COOKIES_FILE`.
+Render — датацентр, и YouTube часто просит «Sign in to confirm you're not a bot» —
+именно cookies решают эту проблему. Вернуть YouTube в cobalt можно переменной
+`COBALT_YOUTUBE=1`, но тогда нужен инстанс, который умеет YouTube.
 
-Render — датацентр, и YouTube часто просит «Sign in to confirm you're not a bot».
-Иногда yt-dlp проходит и с Render, но стабильнее всего — свой cobalt-инстанс
-с ключом или cookies сервисов.
+Instagram/Reddit/Rutube: бот сначала пробует `COBALT_API` (если задан), затем
+обычный yt-dlp. Список сервисов — `COBALT_SERVICES` (по умолчанию
+`instagram,reddit,rutube`).
 
 Важно: публичный `api.cobalt.tools` YouTube **не поддерживает**, а бесплатные
 публичные инстансы требуют токен turnstile (`error.api.auth.jwt.missing`).

@@ -25,6 +25,7 @@ from config import (
     COBALT_PROXY,
     COBALT_QUALITY,
     COBALT_SERVICES,
+    COBALT_YOUTUBE,
     COOKIES_FILE,
     FA_COOKIE,
     FA_LOGIN,
@@ -1203,7 +1204,8 @@ def _yt_bot_check(exc: Exception) -> bool:
 
 YOUTUBE_BOT_CHECK = (
     "YouTube не пустил сервер без входа.\n"
-    "Укажите COBALT_API (свой инстанс cobalt) или COOKIES_FILE с cookies YouTube."
+    "Обновите COOKIES_FILE с cookies YouTube (или включите COBALT_YOUTUBE=1 "
+    "с рабочим COBALT_API)."
 )
 
 # Совместимость со старыми сборками: прежний inline.py ещё импортирует это имя.
@@ -1258,7 +1260,7 @@ _COBALT_LADDER = ("max", "2160", "1440", "1080", "720", "480", "360", "240", "14
 
 # Сервисы, которые умеет cobalt, и их домены. Ключи совпадают с именами
 # сервисов в cobalt. Какие из них реально отдавать в cobalt, задаёт
-# COBALT_SERVICES (YouTube включается всегда, когда задан COBALT_API).
+# COBALT_SERVICES. YouTube включается отдельно — через COBALT_YOUTUBE.
 _COBALT_HOSTS = {
     "youtube": ("youtube.com", "youtu.be", "youtube-nocookie.com"),
     "instagram": ("instagram.com", "instagr.am", "ddinstagram.com"),
@@ -1305,7 +1307,7 @@ def _cobalt_auth(auth: str) -> str:
 
 
 def _cobalt_services() -> set[str]:
-    """Список сервисов из COBALT_SERVICES (без YouTube — он всегда включён)."""
+    """Список сервисов из COBALT_SERVICES (YouTube задаётся отдельно)."""
     raw = (COBALT_SERVICES or "").replace("\\n", ",")
     return {chunk.strip().lower() for chunk in raw.split(",") if chunk.strip()}
 
@@ -1318,7 +1320,12 @@ def _cobalt_service(url: str) -> str | None:
             host = host[len(prefix):]
     enabled = _cobalt_services()
     for name, domains in _COBALT_HOSTS.items():
-        if name != "youtube" and name not in enabled:
+        if name == "youtube":
+            # YouTube по умолчанию идёт напрямую в yt-dlp: cookies из
+            # COOKIES_FILE надёжнее, чем заведомо неудачный запрос в cobalt.
+            if not COBALT_YOUTUBE:
+                continue
+        elif name not in enabled:
             continue
         if any(host == domain or host.endswith("." + domain) for domain in domains):
             return name
@@ -1326,10 +1333,10 @@ def _cobalt_service(url: str) -> str | None:
 
 
 def _use_cobalt(url: str) -> bool:
-    """Сначала cobalt: YouTube — всегда, остальные — если включены в COBALT_SERVICES."""
+    """Сначала cobalt: YouTube — при COBALT_YOUTUBE=1, остальные — из COBALT_SERVICES."""
     if not _cobalt_instances():
         return False
-    return is_youtube(url) or _cobalt_service(url) is not None
+    return _cobalt_service(url) is not None
 
 
 def _cobalt_open(request: urllib.request.Request, timeout: int):
@@ -1799,24 +1806,24 @@ def _download_audio_sync(
 
     cobalt_error: str | None = None
     target = _public_url(track.url)
-    if track.provider == "yt" or _use_cobalt(target):
-        if track.provider == "yt" or is_youtube(target):
-            # YouTube: сначала cobalt (как в cobold), потом обычный yt-dlp
-            track = Track(
-                provider="yt",
-                video_id=track.video_id,
-                url=target,
-                title=track.title,
-                uploader=track.uploader,
-                duration=track.duration,
-            )
-        if _cobalt_instances() and _use_cobalt(track.url):
-            try:
-                return _cobalt_download_sync(track.url, out_dir, "audio", on_progress)
-            except DownloadError as exc:
-                cobalt_error = str(exc)
-                log.warning("cobalt (аудио) не осилил %s: %s", track.url, exc)
-                _clear_dir(out_dir)
+    if track.provider == "yt":
+        # YouTube нормализуем на youtu.be. В cobalt отправляем только при
+        # COBALT_YOUTUBE=1, иначе сразу yt-dlp с cookies из COOKIES_FILE.
+        track = Track(
+            provider="yt",
+            video_id=track.video_id,
+            url=target,
+            title=track.title,
+            uploader=track.uploader,
+            duration=track.duration,
+        )
+    if _cobalt_instances() and _use_cobalt(track.url):
+        try:
+            return _cobalt_download_sync(track.url, out_dir, "audio", on_progress)
+        except DownloadError as exc:
+            cobalt_error = str(exc)
+            log.warning("cobalt (аудио) не осилил %s: %s", track.url, exc)
+            _clear_dir(out_dir)
 
     if track.provider == "hm":
         return _hitmo_download_sync(track, out_dir, on_progress)
@@ -2673,9 +2680,9 @@ def _download_media_sync(
 
     url = _public_url(url)
 
-    # cobalt: YouTube и сервисы из COBALT_SERVICES. Если он не справился —
-    # работает обычный путь yt-dlp. При обоюдной ошибке показываем причину
-    # от cobalt, если yt-dlp упёрся в проверку «я не робот».
+    # cobalt: сервисы из COBALT_SERVICES (YouTube — только при COBALT_YOUTUBE=1).
+    # Если он не справился — работает обычный путь yt-dlp. При обоюдной ошибке
+    # показываем причину от cobalt, если yt-dlp упёрся в проверку «я не робот».
     cobalt_error: str | None = None
     if _use_cobalt(url):
         try:

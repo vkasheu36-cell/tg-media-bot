@@ -42,7 +42,7 @@ POT_SERVER: str = (os.getenv("POT_SERVER") or "").strip()
 # Необязательно: прокси для yt-dlp, например socks5://127.0.0.1:1080
 PROXY: str | None = (os.getenv("PROXY") or "").strip() or None
 
-# --- cobalt: внешний API, который умеет YouTube -----------------------------
+# --- cobalt: внешний API для YouTube (опционально) и других сервисов --------
 # Так же, как cobold (tskau/cobold), бот отправляет ссылку в cobalt и забирает
 # готовый файл. Инстансы перечисляются через запятую или с новой строки:
 #   https://cobalt.example.com
@@ -53,12 +53,19 @@ PROXY: str | None = (os.getenv("PROXY") or "").strip() or None
 # требуют токен — нужен свой инстанс или ключ от его владельца.
 COBALT_API: str = (os.getenv("COBALT_API") or "").strip()
 
-# Необязательно: стартовое качество YouTube через cobalt (1080/720/480/360/max).
+# Необязательно: гнать YouTube через cobalt. По умолчанию выключено —
+# YouTube идёт напрямую в yt-dlp с cookies из COOKIES_FILE: это быстрее и
+# не тратит время на cobalt, который часто не умеет YouTube без PO-токенов.
+COBALT_YOUTUBE: bool = (
+    os.getenv("COBALT_YOUTUBE") or ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+# Необязательно: стартовое качество при скачивании через cobalt (1080/720/480/360/max).
 # Если файл не влезает в лимит Telegram, бот сам понижает качество.
 COBALT_QUALITY: str = (os.getenv("COBALT_QUALITY") or "1080").strip()
 
 # Необязательно: какие сервисы сначала отдавать в cobalt (через запятую).
-# YouTube идёт в cobalt всегда, когда он задан; остальные — только из списка.
+# YouTube сюда не входит — для него отдельный переключатель COBALT_YOUTUBE.
 # Остальные сервисы качаются прежним путём (yt-dlp и свои разборы).
 COBALT_SERVICES: str = (
     os.getenv("COBALT_SERVICES") or "instagram,reddit,rutube"

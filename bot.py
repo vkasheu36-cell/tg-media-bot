@@ -19,6 +19,7 @@ from config import (
     BOT_TOKEN,
     COBALT_API,
     COBALT_SERVICES,
+    COBALT_YOUTUBE,
     COOKIES_FILE,
     DOWNLOADS_DIR,
     FFMPEG_DIR,
@@ -109,12 +110,13 @@ async def main() -> None:
     storage.cleanup()
     log.info(
         "Бот запущен. Лимит отправки: %s МБ, ffmpeg: %s, cookies: %s, "
-        "cobalt: %s (%s), прокси: %s",
+        "cobalt: %s (%s), youtube: %s, прокси: %s",
         MAX_UPLOAD_MB,
         FFMPEG_DIR or "не найден",
         "есть" if COOKIES_FILE else "нет",
         "есть" if COBALT_API else "нет",
         COBALT_SERVICES or "—",
+        "cobalt" if (COBALT_API and COBALT_YOUTUBE) else "yt-dlp",
         TELEGRAM_PROXY or "нет",
     )
 

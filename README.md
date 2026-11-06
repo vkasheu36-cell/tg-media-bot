@@ -3,7 +3,7 @@
 Готовый бот на Python, который делает ровно то, что на скриншотах:
 
 1. **Поиск музыки** — пишешь `девочка с дайвинчика`, бот показывает список треков с длительностью и кнопками, по нажатию присылает mp3 с обложкой и тегами. Источники: Hitmo и Zvyki (готовые файлы), резерв — SoundCloud.
-2. **Медиа по ссылке** — кидаешь ссылку на YouTube / TikTok / VK / Twitter-X / Instagram / Vimeo / Reddit / SoundCloud / FurAffinity, бот скачивает и присылает видео, фото или файл в чат. Для VK работают ссылки на видео, клипы, фото и посты на стене (если в посте есть фото — придёт фото). YouTube качается через yt-dlp, а если серверный IP блокируется — через cobalt (подробности в разделе ограничений).
+2. **Медиа по ссылке** — кидаешь ссылку на YouTube / TikTok / VK / Twitter-X / Instagram / Vimeo / Reddit / SoundCloud / FurAffinity, бот скачивает и присылает видео, фото или файл в чат. Для VK работают ссылки на видео, клипы, фото и посты на стене (если в посте есть фото — придёт фото). YouTube качается напрямую через yt-dlp с cookies из `COOKIES_FILE`, а при `COBALT_YOUTUBE=1` — через cobalt (подробности в разделе ограничений).
 3. **Работает в любом чате** — набери `@имя_бота <ссылка>` без добавления бота в чат (inline-режим).
 
 Всё на бесплатных компонентах, без платных API и подписок.
@@ -122,9 +122,10 @@ python bot.py
 | `BOT_TOKEN` | да | токен от @BotFather |
 | `COOKIES_FILE` | нет | путь к `cookies.txt` — спасает от «подтвердите, что вы не робот» и открывает Instagram |
 | `YT_COOKIES` | нет | содержимое `cookies.txt` строкой (для PaaS без диска) |
-| `COBALT_API` | нет | адрес(а) cobalt для YouTube/Instagram/Reddit/Rutube: `https://host` или `https://host\|Api-Key …`, несколько через запятую |
+| `COBALT_API` | нет | адрес(а) cobalt для Instagram/Reddit/Rutube (и YouTube при `COBALT_YOUTUBE=1`): `https://host` или `https://host\|Api-Key …`, несколько через запятую |
+| `COBALT_YOUTUBE` | нет | `1` — гнать YouTube через cobalt; по умолчанию `0` (yt-dlp + cookies из `COOKIES_FILE`) |
 | `COBALT_QUALITY` | нет | стартовое качество видео через cobalt, по умолчанию `1080` |
-| `COBALT_SERVICES` | нет | какие сервисы отдавать в cobalt: по умолчанию `instagram,reddit,rutube` (YouTube — всегда) |
+| `COBALT_SERVICES` | нет | какие сервисы отдавать в cobalt: по умолчанию `instagram,reddit,rutube` (YouTube — отдельный `COBALT_YOUTUBE`) |
 | `COBALT_PROXY` | нет | прокси только для запросов в cobalt |
 | `POT_SERVER` | нет | адрес локального провайдера PO-токенов (bgutil) для yt-dlp |
 | `TELEGRAM_PROXY` | нет | прокси для Bot API, `socks5://127.0.0.1:1080` (если Telegram заблокирован) |
@@ -209,12 +210,17 @@ journalctl -u tg-media-bot -f      # живые логи
 Кардинальное решение — свой **локальный Bot API server** (`telegram-bot-api --local`), тогда лимит 2 ГБ, но это отдельный сервис и больше возни.
 
 ### 2. YouTube, Instagram, Reddit, Rutube: cobalt или yt-dlp
-Для этих сервисов бот сначала пробует **cobalt** (если задан `COBALT_API`) — это тот же
-способ, что у [cobold](https://github.com/tskau/cobold): ссылка уходит в API, обратно
-приходит готовый файл. Инстансы перечисляются через запятую или с новой строки;
-после `|` можно указать ключ (`Api-Key …` или `Bearer …`). Какие сервисы отдавать
-в cobalt, задаёт `COBALT_SERVICES` (по умолчанию `instagram,reddit,rutube`; YouTube
-включается всегда).
+YouTube по умолчанию качается напрямую через **yt-dlp** с cookies из
+`COOKIES_FILE` — это быстрее, чем пробовать cobalt, и не зависит от того,
+умеет ли конкретный инстанс YouTube. Вернуть YouTube в cobalt можно
+переменной `COBALT_YOUTUBE=1`.
+
+Для Instagram/Reddit/Rutube бот сначала пробует **cobalt** (если задан
+`COBALT_API`) — это тот же способ, что у [cobold](https://github.com/tskau/cobold):
+ссылка уходит в API, обратно приходит готовый файл. Инстансы перечисляются
+через запятую или с новой строки; после `|` можно указать ключ
+(`Api-Key …` или `Bearer …`). Какие сервисы отдавать в cobalt, задаёт
+`COBALT_SERVICES` (по умолчанию `instagram,reddit,rutube`).
 
 Если cobalt не настроен или не справился, работает **yt-dlp**: формат выбирается
 с предпочтением h264 + m4a, качество автоматически понижается (1080 → 720 → 480 → 360),
@@ -229,8 +235,9 @@ Instagram и Reddit на публичных инстансах тоже част
 для Instagram/Reddit — cookies этих сервисов в инстансе.
 
 Если cobalt не настроен, yt-dlp всё равно попробует скачать напрямую — результат
-зависит от IP и текущих клиентов. При блокировке бот подскажет добавить
-`COBALT_API` или cookies (`COOKIES_FILE` / `YT_COOKIES`).
+зависит от IP и текущих клиентов. При блокировке бот подскажет обновить cookies
+(`COOKIES_FILE` / `YT_COOKIES`) или включить `COBALT_YOUTUBE=1` с рабочим
+`COBALT_API`.
 
 Музыку это не задевает: Hitmo и Zvyki отдают готовые файлы напрямую, без обходов.
 

@@ -76,9 +76,9 @@ HELP_TEXT = (
     "• <code>https://vk.ru/video...</code> или <code>vk.ru/wall...</code> — видео из VK\n"
     "• <code>https://www.furaffinity.net/view/12345678/</code> — картинка с FurAffinity\n"
     "• <code>@имя_бота https://tiktok.com/...</code> — прямо в любом чате\n\n"
-    "YouTube, Instagram, Reddit и Rutube сначала идут через cobalt — так проще\n"
-    "и стабильнее. Если сервис просит вход, добавьте COBALT_API (свой cobalt)\n"
-    "или cookies в COOKIES_FILE. Остальные ссылки качает yt-dlp.\n"
+    "YouTube качается напрямую (yt-dlp + cookies из COOKIES_FILE). Instagram,\n"
+    "Reddit и Rutube сначала идут через cobalt. Если сервис просит вход,\n"
+    "добавьте COBALT_API (свой cobalt) или cookies. Остальные ссылки качает yt-dlp.\n"
     "Ссылки на посты Telegram не поддерживаются: для них нужен юзербот."
 )
 

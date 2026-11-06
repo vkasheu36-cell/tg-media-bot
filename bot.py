@@ -5,6 +5,7 @@ import asyncio
 import logging
 import shutil
 import sys
+from pathlib import Path
 
 from aiogram import Bot, BaseMiddleware, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -67,6 +68,15 @@ async def main() -> None:
 
     _prepare_downloads_dir()
 
+    if COOKIES_FILE:
+        cookie_path = Path(COOKIES_FILE)
+        if cookie_path.exists():
+            log.info("cookies: %s (%s байт)", COOKIES_FILE, cookie_path.stat().st_size)
+        else:
+            log.warning(
+                "cookies: файл %s не найден — YouTube может требовать вход", COOKIES_FILE
+            )
+
     session = AiohttpSession(proxy=TELEGRAM_PROXY) if TELEGRAM_PROXY else None
     bot = Bot(
         token=BOT_TOKEN,
@@ -102,6 +112,7 @@ async def main() -> None:
             [
                 BotCommand(command="start", description="Что я умею"),
                 BotCommand(command="help", description="Помощь"),
+                BotCommand(command="yt_debug", description="Диагностика YouTube"),
             ]
         )
     except TelegramNetworkError as exc:

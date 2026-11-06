@@ -122,6 +122,7 @@ python bot.py
 | `BOT_TOKEN` | да | токен от @BotFather |
 | `COOKIES_FILE` | нет | путь к `cookies.txt` — спасает от «подтвердите, что вы не робот» и открывает Instagram |
 | `YT_COOKIES` | нет | содержимое `cookies.txt` строкой (для PaaS без диска) |
+| `YT_PLAYER_CLIENT` | нет | клиент(ы) YouTube через запятую; обычно не нужен — бот сам перебирает и запоминает рабочий, список показывает `/yt_debug` |
 | `COBALT_API` | нет | адрес(а) cobalt для Instagram/Reddit/Rutube (и YouTube при `COBALT_YOUTUBE=1`): `https://host` или `https://host\|Api-Key …`, несколько через запятую |
 | `COBALT_YOUTUBE` | нет | `1` — гнать YouTube через cobalt; по умолчанию `0` (yt-dlp + cookies из `COOKIES_FILE`) |
 | `COBALT_QUALITY` | нет | стартовое качество видео через cobalt, по умолчанию `1080` |
@@ -238,6 +239,14 @@ Instagram и Reddit на публичных инстансах тоже част
 зависит от IP и текущих клиентов. При блокировке бот подскажет обновить cookies
 (`COOKIES_FILE` / `YT_COOKIES`) или включить `COBALT_YOUTUBE=1` с рабочим
 `COBALT_API`.
+
+**Если YouTube пишет «Failed to extract any player response».** Это значит, что
+YouTube не отдал плеер ни одному клиенту: обычно виноват датацентровый IP Render
+или протухшие cookies. Бот сам перебирает клиентов (`tv`, `visionos`,
+`android_vr`, `mweb` и другие) и запоминает рабочий. Команда
+`/yt_debug https://youtu.be/...` показывает, какие клиенты отвечают с вашего
+сервера, и заодно проверяет cookies. Если не работает ни один — нужен прокси,
+свежие cookies или свой cobalt с PO-токенами.
 
 Музыку это не задевает: Hitmo и Zvyki отдают готовые файлы напрямую, без обходов.
 

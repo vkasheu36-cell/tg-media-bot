@@ -39,9 +39,11 @@ from downloader import (
     download_media,
     fa_diagnose,
     is_music_link,
+    is_youtube,
     resolve_music_link_detailed,
     search,
     service_name,
+    yt_diagnose,
 )
 
 log = logging.getLogger(__name__)
@@ -75,7 +77,8 @@ HELP_TEXT = (
     "<code>rutube.ru/video/...</code> — через cobalt\n"
     "• <code>https://vk.ru/video...</code> или <code>vk.ru/wall...</code> — видео из VK\n"
     "• <code>https://www.furaffinity.net/view/12345678/</code> — картинка с FurAffinity\n"
-    "• <code>@имя_бота https://tiktok.com/...</code> — прямо в любом чате\n\n"
+    "• <code>@имя_бота https://tiktok.com/...</code> — прямо в любом чате\n"
+    "• <code>/yt_debug https://youtu.be/...</code> — почему YouTube не качается\n\n"
     "YouTube качается напрямую (yt-dlp + cookies из COOKIES_FILE). Instagram,\n"
     "Reddit и Rutube сначала идут через cobalt. Если сервис просит вход,\n"
     "добавьте COBALT_API (свой cobalt) или cookies. Остальные ссылки качает yt-dlp.\n"
@@ -400,6 +403,38 @@ async def cmd_fa_debug(message: Message) -> None:
         report = await asyncio.wait_for(fa_diagnose(parts[1].strip()), timeout=150)
     except asyncio.TimeoutError:
         report = "Не успел: FurAffinity отвечал дольше 150 секунд."
+    except Exception as exc:  # noqa: BLE001
+        report = f"{type(exc).__name__}: {exc}"
+    text = html.escape(report)
+    if len(text) > 3900:
+        text = text[:3900] + "…"
+    body = f"<pre>{text}</pre>"
+    try:
+        await status.edit_text(body)
+    except Exception:  # noqa: BLE001
+        await message.answer(body)
+
+
+@router.message(Command("yt_debug"))
+async def cmd_yt_debug(message: Message) -> None:
+    """Диагностика YouTube: какой player_client работает с IP сервера."""
+    parts = (message.text or "").split(maxsplit=1)
+    url = (
+        parts[1].strip()
+        if len(parts) > 1
+        else "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    )
+    if not is_youtube(url):
+        await message.answer(
+            "Пришлите ссылку YouTube:\n"
+            "<code>/yt_debug https://youtu.be/...</code>"
+        )
+        return
+    status = await message.answer("🔎 Проверяю YouTube: перебираю player_client…")
+    try:
+        report = await asyncio.wait_for(yt_diagnose(url), timeout=240)
+    except asyncio.TimeoutError:
+        report = "Не успел за 240 секунд: YouTube отвечал слишком долго."
     except Exception as exc:  # noqa: BLE001
         report = f"{type(exc).__name__}: {exc}"
     text = html.escape(report)

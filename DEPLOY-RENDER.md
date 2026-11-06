@@ -69,6 +69,11 @@ Render — датацентр, и YouTube часто просит «Sign in to c
 именно cookies решают эту проблему. Вернуть YouTube в cobalt можно переменной
 `COBALT_YOUTUBE=1`, но тогда нужен инстанс, который умеет YouTube.
 
+Если в логах «Failed to extract any player response» — бот сам перебирает
+player_client и запоминает рабочий. Проверить, что доступно с IP Render:
+`/yt_debug https://youtu.be/...`. Команда заодно покажет, подхватились ли cookies
+и есть ли в них ключи входа.
+
 Instagram/Reddit/Rutube: бот сначала пробует `COBALT_API` (если задан), затем
 обычный yt-dlp. Список сервисов — `COBALT_SERVICES` (по умолчанию
 `instagram,reddit,rutube`).

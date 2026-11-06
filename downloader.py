@@ -132,9 +132,10 @@ def _opts() -> dict:
     if PROXY:
         opts["proxy"] = PROXY
     extractor_args: dict[str, dict[str, list[str]]] = {}
-    if YT_PLAYER_CLIENT:
+    clients = _yt_client or YT_PLAYER_CLIENT
+    if clients:
         extractor_args["youtube"] = {
-            "player_client": [c.strip() for c in YT_PLAYER_CLIENT.split(",") if c.strip()]
+            "player_client": [c.strip() for c in clients.split(",") if c.strip()]
         }
     if POT_SERVER:
         # локальный провайдер PO-токенов: YouTube считает запрос «браузерным»
@@ -144,6 +145,96 @@ def _opts() -> dict:
     if FFMPEG_DIR:
         opts["ffmpeg_location"] = FFMPEG_DIR
     return opts
+
+
+# YouTube на датацентровом IP часто не отдаёт player response для клиента по
+# умолчанию. Перебираем клиентов, пока какой-нибудь не ответит, и запоминаем
+# рабочий на процесс — чтобы следующие ссылки качались сразу через него.
+_YT_CLIENT_LADDER = (
+    "tv",
+    "visionos",
+    "android_vr",
+    "web_safari",
+    "mweb",
+    "ios",
+    "tv_simply",
+    "web",
+)
+_yt_client: str | None = None
+
+
+def _yt_client_opts(client: str) -> dict:
+    """Опции yt-dlp с принудительным player_client для YouTube."""
+    opts = _opts()
+    args = dict(opts.get("extractor_args") or {})
+    args["youtube"] = {"player_client": [client]}
+    opts["extractor_args"] = args
+    return opts
+
+
+def _yt_player_blocked(exc: Exception) -> bool:
+    """Похоже ли, что YouTube не отдал плеер (а не «видео удалено»)."""
+    low = str(exc).lower()
+    return (
+        "failed to extract any player response" in low
+        or "sign in to confirm" in low
+        or "not a bot" in low
+        or "no video formats" in low
+        or "the page needs to be reloaded" in low
+    )
+
+
+def _yt_should_retry(exc: Exception, download: bool) -> bool:
+    """Стоит ли перебирать player_client после этой ошибки."""
+    if _yt_player_blocked(exc):
+        return True
+    # при пробе форматов не запрашивается, поэтому такая ошибка тоже означает,
+    # что клиент не отдал ролик (а не что выбранного качества нет)
+    return not download and "requested format is not available" in str(exc).lower()
+
+
+def _extract_info(url: str, opts: dict, download: bool = False):
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        data = ydl.extract_info(url, download=download)
+        return ydl.sanitize_info(data) if data else {}
+
+
+def _extract_with_rescue(url: str, opts: dict, download: bool = False):
+    """extract_info; если YouTube не дал плеер — перебираем player_client."""
+    global _yt_client
+
+    try:
+        return _dns_retry(lambda: _extract_info(url, opts, download=download))
+    except Exception as exc:  # noqa: BLE001
+        if not is_youtube(url) or not _yt_should_retry(exc, download):
+            raise
+
+        # клиенты из YT_PLAYER_CLIENT уже пробовались вместе — не повторяем их
+        explicit = {c.strip() for c in (YT_PLAYER_CLIENT or "").split(",") if c.strip()}
+        ladder: list[str] = [c for c in _YT_CLIENT_LADDER if c not in explicit]
+
+        last = exc
+        for client in ladder:
+            attempt = dict(opts)
+            # при переборе не тратим минуты на повторы одного и того же клиента
+            attempt["extractor_retries"] = 1
+            attempt["retries"] = 1
+            attempt["socket_timeout"] = 12
+            args = dict(attempt.get("extractor_args") or {})
+            args["youtube"] = {"player_client": [client]}
+            attempt["extractor_args"] = args
+            try:
+                info = _dns_retry(lambda: _extract_info(url, attempt, download=download))
+            except Exception as inner:  # noqa: BLE001
+                last = inner
+                log.info("YouTube: клиент %s не подошёл: %s", client, inner)
+                continue
+            _yt_client = client
+            log.warning("YouTube: работает player_client=%s", client)
+            return info
+        if _yt_player_blocked(exc) and not _yt_player_blocked(last):
+            raise exc
+        raise last
 
 
 _SERVICES = {
@@ -367,6 +458,11 @@ def friendly_error(exc: Exception, url: str | None = None) -> str:
     prefix = f"{service_name(url)}: " if url else ""
 
     if "requested format is not available" in low:
+        if url and is_youtube(url):
+            return (
+                f"{prefix}не отдал форматы для скачивания.\n"
+                "Выполните /yt_debug — он покажет рабочий player_client."
+            )
         return f"{prefix}нет подходящего качества.\nПопробуйте другую ссылку."
     if "no video could be found" in low:
         return f"{prefix}в этом посте нет видео, а картинку получить не удалось."
@@ -378,6 +474,13 @@ def friendly_error(exc: Exception, url: str | None = None) -> str:
             "Для Instagram/TikTok помогают cookies аккаунта:\n"
             "COOKIES_FILE или YT_COOKIES."
         )
+    if "failed to extract any player response" in low:
+        if url and is_youtube(url):
+            return (
+                f"{prefix}не отдал видео: сервер не получил player response.\n"
+                "Проверьте cookies (COOKIES_FILE) и выполните /yt_debug — "
+                "он покажет, какой player_client работает."
+            )
     if "too many requests" in low or "http error 429" in low or "rate limit" in low:
         return f"{prefix}ограничил запросы.\nПодождите пару минут."
     if "logged-in" in low or "login" in low or "cookies" in low or "authentication" in low:
@@ -1204,8 +1307,8 @@ def _yt_bot_check(exc: Exception) -> bool:
 
 YOUTUBE_BOT_CHECK = (
     "YouTube не пустил сервер без входа.\n"
-    "Обновите COOKIES_FILE с cookies YouTube (или включите COBALT_YOUTUBE=1 "
-    "с рабочим COBALT_API)."
+    "Обновите COOKIES_FILE с cookies YouTube и выполните /yt_debug "
+    "(или включите COBALT_YOUTUBE=1 с рабочим COBALT_API)."
 )
 
 # Совместимость со старыми сборками: прежний inline.py ещё импортирует это имя.
@@ -1853,13 +1956,8 @@ def _download_audio_sync(
         ],
     }
 
-    def _fetch():
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            data = ydl.extract_info(_public_url(url), download=True)
-            return ydl.sanitize_info(data) if data else {}
-
     try:
-        info = _dns_retry(_fetch)
+        info = _extract_with_rescue(_public_url(url), opts, download=True)
     except Exception as exc:
         if cobalt_error and _yt_bot_check(exc):
             raise DownloadError(cobalt_error) from exc
@@ -2673,6 +2771,80 @@ async def fa_diagnose(url: str) -> str:
     return await asyncio.to_thread(_fa_diagnose_sync, url)
 
 
+def _cookie_report() -> str:
+    """Кратко о cookies: размер файла и признаки входа (без самих значений)."""
+    if not COOKIES_FILE:
+        return "cookies: не заданы (COOKIES_FILE пуст)"
+    path = Path(COOKIES_FILE)
+    if not path.exists():
+        return f"cookies: файла нет: {COOKIES_FILE}"
+    try:
+        text = path.read_text("utf-8", "replace")
+    except OSError as exc:
+        return f"cookies: не читаются: {exc}"
+    rows = [line for line in text.splitlines() if line and not line.startswith("#")]
+    yt_rows = [line for line in rows if "youtube" in line or "google" in line]
+    names = set()
+    for line in yt_rows:
+        parts = line.split("\t")
+        if len(parts) >= 6:
+            names.add(parts[5])
+    keys = [
+        key
+        for key in ("SID", "HSID", "SSID", "APISID", "SAPISID", "LOGIN_INFO",
+                    "__Secure-1PSID", "__Secure-3PSID")
+        if key in names
+    ]
+    tail = f", ключи входа: {', '.join(keys)}" if keys else ", ключей входа не видно"
+    return (
+        f"cookies: {path.name}, {path.stat().st_size} байт, "
+        f"строк youtube/google: {len(yt_rows)}{tail}"
+    )
+
+
+def _yt_diagnose_sync(url: str) -> str:
+    """Проверяет, какой player_client YouTube пускает с IP Render."""
+    lines = [
+        f"yt-dlp: {yt_dlp.version.__version__}",
+        _cookie_report(),
+        f"YT_PLAYER_CLIENT: {YT_PLAYER_CLIENT or '—'}",
+        f"POT_SERVER: {'есть' if POT_SERVER else 'нет'}",
+        f"PROXY: {'есть' if PROXY else 'нет'}",
+        f"рабочий клиент в памяти: {_yt_client or '—'}",
+        "",
+    ]
+    clients = list(_YT_CLIENT_LADDER)
+    for chunk in (YT_PLAYER_CLIENT or "").split(","):
+        chunk = chunk.strip()
+        if chunk and chunk not in clients:
+            clients.insert(0, chunk)
+    for client in clients:
+        opts = _yt_client_opts(client) | {
+            "skip_download": True,
+            "socket_timeout": 12,
+            "extractor_retries": 1,
+            "retries": 1,
+        }
+        try:
+            info = _extract_info(url, opts)
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc).replace("\n", " ")
+            lines.append(f"{client}: ошибка — {message[:130]}")
+            continue
+        formats = info.get("formats") or []
+        heights = [f.get("height") for f in formats if f.get("height")]
+        title = (info.get("title") or "")[:45]
+        lines.append(
+            f"{client}: OK — {title} | форматов {len(formats)}, "
+            f"макс {max(heights) if heights else '?'}p"
+        )
+    return "\n".join(lines)
+
+
+async def yt_diagnose(url: str) -> str:
+    return await asyncio.to_thread(_yt_diagnose_sync, url)
+
+
 def _download_media_sync(
     url: str, out_dir: Path, on_progress=None
 ) -> tuple[Path, dict]:
@@ -2710,11 +2882,10 @@ def _download_media_sync(
 
     # 1) лёгкий проход без скачивания: узнаём форматы, размеры, метаданные
     def _probe():
-        with yt_dlp.YoutubeDL(_opts() | {"skip_download": True}) as ydl:
-            return ydl.extract_info(url, download=False)
+        return _extract_with_rescue(url, _opts() | {"skip_download": True})
 
     try:
-        info = _dns_retry(_probe)
+        info = _probe()
     except Exception as exc:
         if cobalt_error and _yt_bot_check(exc):
             raise DownloadError(cobalt_error) from exc
@@ -2734,7 +2905,7 @@ def _download_media_sync(
         if kind == "embed":
             log.info("VK: видео найдено на странице: %s", media)
             url = media
-            info = _dns_retry(_probe)
+            info = _probe()
         else:
             return _vk_download_direct(kind, media, out_dir)
 
@@ -2752,7 +2923,7 @@ def _download_media_sync(
             if og and og[0] == "embed":
                 log.info("VK: видео найдено на странице: %s", og[1])
                 url = og[1]
-                info = _dns_retry(_probe)
+                info = _probe()
                 entries = (
                     [e for e in (info.get("entries") or []) if e]
                     if info.get("_type") == "playlist"
@@ -2769,7 +2940,7 @@ def _download_media_sync(
         if entry_url.startswith("http") and entry_url != url:
             url = entry_url
             try:
-                info = _dns_retry(_probe)
+                info = _probe()
             except Exception as exc:  # noqa: BLE001
                 log.warning("VK: вложение не разобралось (%s): %s", entry_url, exc)
                 info = entry
@@ -2811,12 +2982,7 @@ def _download_media_sync(
             "progress_hooks": _progress_hook(on_progress, budget),
         }
         try:
-            def _fetch():
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    data = ydl.extract_info(url, download=True)
-                    return ydl.sanitize_info(data) if data else {}
-
-            data = _dns_retry(_fetch)
+            data = _extract_with_rescue(url, opts, download=True)
         except _TooBig:
             # скачивание прервано на лимите — пробуем качество пониже
             too_big = True

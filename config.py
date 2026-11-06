@@ -42,6 +42,31 @@ POT_SERVER: str = (os.getenv("POT_SERVER") or "").strip()
 # Необязательно: прокси для yt-dlp, например socks5://127.0.0.1:1080
 PROXY: str | None = (os.getenv("PROXY") or "").strip() or None
 
+# --- cobalt: внешний API, который умеет YouTube -----------------------------
+# Так же, как cobold (tskau/cobold), бот отправляет ссылку в cobalt и забирает
+# готовый файл. Инстансы перечисляются через запятую или с новой строки:
+#   https://cobalt.example.com
+#   https://cobalt.example.com|Api-Key 12345678
+#   https://cobalt.example.com|Bearer eyJhbGciOi...
+# Всё после | уходит в заголовок Authorization.
+# Публичный api.cobalt.tools YouTube не поддерживает, а бесплатные инстансы
+# требуют токен — нужен свой инстанс или ключ от его владельца.
+COBALT_API: str = (os.getenv("COBALT_API") or "").strip()
+
+# Необязательно: стартовое качество YouTube через cobalt (1080/720/480/360/max).
+# Если файл не влезает в лимит Telegram, бот сам понижает качество.
+COBALT_QUALITY: str = (os.getenv("COBALT_QUALITY") or "1080").strip()
+
+# Необязательно: какие сервисы сначала отдавать в cobalt (через запятую).
+# YouTube идёт в cobalt всегда, когда он задан; остальные — только из списка.
+# Остальные сервисы качаются прежним путём (yt-dlp и свои разборы).
+COBALT_SERVICES: str = (
+    os.getenv("COBALT_SERVICES") or "instagram,reddit,rutube"
+).strip()
+
+# Необязательно: прокси только для запросов в cobalt (не для Telegram).
+COBALT_PROXY: str | None = (os.getenv("COBALT_PROXY") or "").strip() or None
+
 # Cookies FurAffinity для работ 18+ (аккаунт second-acc).
 # FA отдаёт «взрослые» страницы только после входа, а вход по паролю с
 # серверного IP отвечает 503 — поэтому используются готовые cookies сессии.
@@ -49,7 +74,7 @@ PROXY: str | None = (os.getenv("PROXY") or "").strip() or None
 # Если сессия протухла: войти в FA в браузере и обновить a и b.
 FA_COOKIE: str = (
     os.getenv("FA_COOKIE")
-    or "a=12eed7f5-3189-4ab6-93ce-32914f148a83; b=dc2f70f8-9616-42fc-9a0b-8d1f7c8a0c6e"
+    or "a=d4a2cf01-652b-47c7-88fa-95a1285534fd; b=d32858cd-9796-4293-91da-7a2e100922ef"
 ).strip()
 
 # Необязательно: аккаунт FurAffinity, под которым бот входит сам.

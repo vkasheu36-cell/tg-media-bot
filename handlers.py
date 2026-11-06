@@ -35,12 +35,10 @@ from downloader import (
     SEMAPHORE as _semaphore,
     DownloadError,
     Track,
-    YOUTUBE_DISABLED,
     download_audio,
     download_media,
     fa_diagnose,
     is_music_link,
-    is_youtube,
     resolve_music_link_detailed,
     search,
     service_name,
@@ -61,8 +59,8 @@ START_TEXT = (
     "👋 <b>Привет! Я умею две вещи:</b>\n\n"
     "🎵 <b>Музыка</b> — пришли название трека или «исполнитель - название», "
     "я найду варианты и пришлю mp3.\n\n"
-    "📥 <b>Медиа по ссылке</b> — кинь ссылку на TikTok, VK, Twitter/X, Instagram, "
-    "Vimeo, Reddit, SoundCloud, FurAffinity и многое другое — пришлю файл.\n\n"
+    "📥 <b>Медиа по ссылке</b> — кинь ссылку на YouTube, TikTok, VK, Twitter/X, "
+    "Instagram, Reddit, Rutube, Vimeo, SoundCloud, FurAffinity и многое другое — пришлю файл.\n\n"
     "💬 <b>В любом чате</b> — набери <code>@имя_бота</code> и ссылку или название трека, "
     "не добавляя меня в чат.\n\n"
     "Лимит Telegram — 50 МБ на файл, поэтому видео автоматически ужимается по качеству."
@@ -72,10 +70,15 @@ HELP_TEXT = (
     "<b>Как пользоваться</b>\n\n"
     "• <code>девочка с дайвинчика</code> — поиск музыки\n"
     "• <code>https://www.tiktok.com/...</code> — скачать видео\n"
+    "• <code>https://youtu.be/...</code> — видео или mp3 с YouTube\n"
+    "• <code>instagram.com/p/...</code>, <code>reddit.com/r/...</code>, "
+    "<code>rutube.ru/video/...</code> — через cobalt\n"
     "• <code>https://vk.ru/video...</code> или <code>vk.ru/wall...</code> — видео из VK\n"
     "• <code>https://www.furaffinity.net/view/12345678/</code> — картинка с FurAffinity\n"
     "• <code>@имя_бота https://tiktok.com/...</code> — прямо в любом чате\n\n"
-    "YouTube не поддерживается: с серверного IP он требует вход.\n"
+    "YouTube, Instagram, Reddit и Rutube сначала идут через cobalt — так проще\n"
+    "и стабильнее. Если сервис просит вход, добавьте COBALT_API (свой cobalt)\n"
+    "или cookies в COOKIES_FILE. Остальные ссылки качает yt-dlp.\n"
     "Ссылки на посты Telegram не поддерживаются: для них нужен юзербот."
 )
 
@@ -616,10 +619,6 @@ async def _fa_preview(status: Message, url: str, detail: str) -> None:
 
 
 async def handle_link(message: Message, url: str) -> None:
-    if is_youtube(url):
-        await message.answer(YOUTUBE_DISABLED)
-        return
-
     if any(host in url for host in ("t.me/", "telegram.me/", "telegram.dog/")):
         await message.answer(
             "Ссылки на посты Telegram я не открываю: для этого нужен юзербот "

@@ -21,6 +21,10 @@ from urllib.parse import urlsplit, urlunsplit
 import yt_dlp
 
 from config import (
+    COBALT_API,
+    COBALT_PROXY,
+    COBALT_QUALITY,
+    COBALT_SERVICES,
     COOKIES_FILE,
     FA_COOKIE,
     FA_LOGIN,
@@ -155,6 +159,7 @@ _SERVICES = {
     "vk.cc": "VK",
     "vk.link": "VK",
     "reddit.com": "Reddit",
+    "redd.it": "Reddit",
     "vimeo.com": "Vimeo",
     "soundcloud.com": "SoundCloud",
     "hitmoz.org": "Hitmo",
@@ -365,10 +370,12 @@ def friendly_error(exc: Exception, url: str | None = None) -> str:
     if "no video could be found" in low:
         return f"{prefix}в этом посте нет видео, а картинку получить не удалось."
     if "sign in to confirm" in low or "not a bot" in low:
+        if url and is_youtube(url):
+            return YOUTUBE_BOT_CHECK
         return (
             f"{prefix}не пускает сервер без входа.\n"
-            "Если это YouTube — он ботом не поддерживается. Для Instagram/TikTok\n"
-            "помогают cookies аккаунта: COOKIES_FILE или YT_COOKIES."
+            "Для Instagram/TikTok помогают cookies аккаунта:\n"
+            "COOKIES_FILE или YT_COOKIES."
         )
     if "too many requests" in low or "http error 429" in low or "rate limit" in low:
         return f"{prefix}ограничил запросы.\nПодождите пару минут."
@@ -1176,7 +1183,6 @@ def _zvyki_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Pat
 
 
 def is_youtube(url: str) -> bool:
-    """YouTube убран из бота: с серверных IP он отдаёт «подтвердите вход»."""
     host = (urlsplit(url).netloc or "").lower()
     return (
         host.endswith("youtube.com")
@@ -1185,10 +1191,421 @@ def is_youtube(url: str) -> bool:
     )
 
 
-YOUTUBE_DISABLED = (
-    "YouTube больше не скачивается: с серверного IP он требует вход.\n"
-    "Пришлите ссылку на другой сервис или название трека — найду в музыке."
+def _yt_bot_check(exc: Exception) -> bool:
+    """YouTube просит «подтвердите, что вы не робот»."""
+    low = str(exc).lower()
+    return (
+        "sign in to confirm" in low
+        or "not a bot" in low
+        or "confirm you" in low
+    )
+
+
+YOUTUBE_BOT_CHECK = (
+    "YouTube не пустил сервер без входа.\n"
+    "Укажите COBALT_API (свой инстанс cobalt) или COOKIES_FILE с cookies YouTube."
 )
+
+
+# ---------------------------------------------------------------- cobalt
+# cobold (tskau/cobold) не качает YouTube сам: он отправляет ссылку в cobalt API,
+# получает tunnel/redirect/picker и пересылает файл в Telegram. Здесь тот же
+# принцип: инстансы перебираются по очереди, ошибки переводятся на русский.
+# Публичные инстансы YouTube обычно не отдают (нужен ключ/свой сервер), зато
+# тот же клиент пригодится для остальных сервисов cobalt.
+
+
+class _CobaltError(Exception):
+    """Ответ cobalt со статусом error (или сетевой сбой)."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+class _CobaltTooBig(Exception):
+    """Файл больше лимита Telegram — надо пробовать качество пониже."""
+
+
+_COBALT_MESSAGES = {
+    "error.api.missing": (
+        "cobalt не настроен: добавьте COBALT_API в переменные окружения."
+    ),
+    "error.api.connection": "cobalt не отвечает — проверьте адрес в COBALT_API.",
+    "error.api.bad_response": "cobalt ответил непонятно — возможно, это не cobalt.",
+    "error.api.auth.jwt.missing": (
+        "инстанс требует токен turnstile — нужен свой инстанс или ключ от владельца."
+    ),
+    "error.api.auth.api_key.missing": "инстанс требует API-ключ.",
+    "error.api.auth.key.invalid": "инстанс не принял API-ключ.",
+    "error.api.rate_exceeded": "инстанс ограничил частоту запросов — подождите минуту.",
+    "error.api.youtube.login": "YouTube требует вход в аккаунт.",
+    "error.api.youtube.no_session_tokens": "YouTube требует сессию/PO-токен.",
+    "error.api.content.video.age": (
+        "видео с возрастным ограничением — нужны cookies аккаунта YouTube."
+    ),
+    "error.api.content.video.region": "видео заблокировано в регионе инстанса.",
+    "error.api.content.video.unavailable": "видео недоступно (удалено или скрыто).",
+    "error.api.service.unsupported": "этот инстанс не умеет YouTube.",
+}
+
+# от лучшего к худшему: если файл не влезает в лимит — понижаем качество
+_COBALT_LADDER = ("max", "2160", "1440", "1080", "720", "480", "360", "240", "144")
+
+# Сервисы, которые умеет cobalt, и их домены. Ключи совпадают с именами
+# сервисов в cobalt. Какие из них реально отдавать в cobalt, задаёт
+# COBALT_SERVICES (YouTube включается всегда, когда задан COBALT_API).
+_COBALT_HOSTS = {
+    "youtube": ("youtube.com", "youtu.be", "youtube-nocookie.com"),
+    "instagram": ("instagram.com", "instagr.am", "ddinstagram.com"),
+    "reddit": ("reddit.com", "redd.it", "redditmedia.com"),
+    "rutube": ("rutube.ru",),
+    "tiktok": ("tiktok.com", "tt.site"),
+    "twitter": ("twitter.com", "x.com"),
+    "soundcloud": ("soundcloud.com", "snd.sc"),
+    "facebook": ("facebook.com", "fb.watch"),
+    "vimeo": ("vimeo.com",),
+    "twitch": ("twitch.tv",),
+    "dailymotion": ("dailymotion.com", "dai.ly"),
+    "ok": ("ok.ru",),
+    "pinterest": ("pinterest.com", "pin.it"),
+    "tumblr": ("tumblr.com",),
+    "snapchat": ("snapchat.com",),
+    "streamable": ("streamable.com",),
+    "newgrounds": ("newgrounds.com",),
+    "bilibili": ("bilibili.com", "b23.tv"),
+    "bluesky": ("bsky.app",),
+    "loom": ("loom.com",),
+}
+
+
+def _cobalt_instances() -> list[tuple[str, str]]:
+    """Разбирает COBALT_API: url или url|auth, по одному в строке/через запятую."""
+    instances: list[tuple[str, str]] = []
+    raw = (COBALT_API or "").replace("\\n", "\n")
+    for chunk in re.split(r"[\n,]+", raw):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        url, _, auth = chunk.partition("|")
+        url = url.strip().rstrip("/")
+        if not url.startswith("http"):
+            continue
+        instances.append((url, auth.strip()))
+    return instances
+
+
+def _cobalt_auth(auth: str) -> str:
+    """cobold передаёт auth как есть; голый ключ считаем Api-Key."""
+    return auth if " " in auth else f"Api-Key {auth}"
+
+
+def _cobalt_services() -> set[str]:
+    """Список сервисов из COBALT_SERVICES (без YouTube — он всегда включён)."""
+    raw = (COBALT_SERVICES or "").replace("\\n", ",")
+    return {chunk.strip().lower() for chunk in raw.split(",") if chunk.strip()}
+
+
+def _cobalt_service(url: str) -> str | None:
+    """Имя сервиса cobalt, если ссылку стоит сначала отдать в cobalt."""
+    host = (urlsplit(url).netloc or "").lower()
+    for prefix in ("www.", "m.", "mobile."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    enabled = _cobalt_services()
+    for name, domains in _COBALT_HOSTS.items():
+        if name != "youtube" and name not in enabled:
+            continue
+        if any(host == domain or host.endswith("." + domain) for domain in domains):
+            return name
+    return None
+
+
+def _use_cobalt(url: str) -> bool:
+    """Сначала cobalt: YouTube — всегда, остальные — если включены в COBALT_SERVICES."""
+    if not _cobalt_instances():
+        return False
+    return is_youtube(url) or _cobalt_service(url) is not None
+
+
+def _cobalt_open(request: urllib.request.Request, timeout: int):
+    if COBALT_PROXY:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": COBALT_PROXY, "https": COBALT_PROXY})
+        )
+        return opener.open(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def _cobalt_post(base: str, auth: str, payload: dict, timeout: int = 120) -> dict:
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if auth:
+        headers["Authorization"] = _cobalt_auth(auth)
+    request = urllib.request.Request(
+        f"{base}/",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+    status = 0
+    try:
+        with _cobalt_open(request, timeout) as response:
+            status = response.status
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        try:
+            raw = exc.read()
+        except Exception:  # noqa: BLE001
+            raw = b""
+    except Exception as exc:  # noqa: BLE001
+        raise _CobaltError(f"error.api.connection: {exc}") from exc
+
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError as exc:
+        raise _CobaltError(f"error.api.bad_response: HTTP {status}") from exc
+
+    if not isinstance(data, dict):
+        raise _CobaltError("error.api.bad_response")
+    if data.get("status") == "error":
+        error = data.get("error")
+        code = error.get("code") if isinstance(error, dict) else error
+        raise _CobaltError(str(code or "error.api.unknown"))
+    return data
+
+
+def _cobalt_payload(url: str, mode: str, quality: str) -> dict:
+    if mode == "audio":
+        return {
+            "url": url,
+            "downloadMode": "audio",
+            "filenameStyle": "basic",
+            "audioFormat": "mp3",
+            "audioBitrate": "320",
+        }
+    payload = {
+        "url": url,
+        "downloadMode": "auto",
+        "filenameStyle": "basic",
+        "videoQuality": quality,
+    }
+    if is_youtube(url):
+        payload |= {
+            "youtubeVideoCodec": "h264",
+            "youtubeVideoContainer": "mp4",
+            "youtubeBetterAudio": True,
+        }
+    return payload
+
+
+def _cobalt_pick(data: dict) -> tuple[str, str]:
+    """Достаёт из ответа ссылку на файл и имя (tunnel/redirect/picker/…)."""
+    status = data.get("status")
+
+    if status == "picker":
+        items = [i for i in (data.get("picker") or []) if isinstance(i, dict) and i.get("url")]
+        if not items:
+            raise _CobaltError("error.api.content.video.unavailable")
+        item = next((i for i in items if i.get("type") == "video"), items[0])
+        return str(item["url"]), str(item.get("filename") or "")
+
+    if status == "local-processing":
+        tunnels = [t for t in (data.get("tunnel") or []) if isinstance(t, str)]
+        if not tunnels:
+            raise _CobaltError("error.api.content.video.unavailable")
+        output = data.get("output") or {}
+        return tunnels[0], str(output.get("filename") or "")
+
+    if status in ("tunnel", "redirect"):
+        url = data.get("url")
+        if not url:
+            raise _CobaltError("error.api.content.video.unavailable")
+        return str(url), str(data.get("filename") or "")
+
+    raise _CobaltError("error.api.bad_response")
+
+
+def _cobalt_filename(raw: str, fallback: str) -> str:
+    name = urllib.parse.unquote(raw or "")
+    name = name.split("?", 1)[0].rsplit("/", 1)[-1]
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", name).strip(" .")
+    if not name:
+        return fallback
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    stem = (stem.strip(" .") or fallback.rsplit(".", 1)[0])[:80].strip(" .")
+    ext = re.sub(r"[^A-Za-z0-9]", "", ext)[:5].lower()
+    if not ext and "." in fallback:
+        ext = fallback.rsplit(".", 1)[-1]
+    return f"{stem}.{ext}" if ext else stem
+
+
+def _cobalt_fetch(
+    file_url: str,
+    out_dir: Path,
+    filename: str,
+    auth: str,
+    budget: int,
+    on_progress=None,
+) -> Path:
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+    if auth:
+        headers["Authorization"] = _cobalt_auth(auth)
+    request = urllib.request.Request(file_url, headers=headers)
+
+    with _cobalt_open(request, timeout=180) as response:
+        ctype = (response.headers.get("Content-Type") or "").lower()
+        if "text/html" in ctype or "application/json" in ctype:
+            raise _CobaltError("error.api.bad_response")
+
+        total = int(response.headers.get("Content-Length") or 0)
+        if total > budget:
+            raise _CobaltTooBig()
+
+        dest = out_dir / _cobalt_filename(filename, "media.mp4")
+        done = 0
+        try:
+            with dest.open("wb") as handle:
+                while True:
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    done += len(chunk)
+                    if done > budget:
+                        raise _CobaltTooBig()
+                    handle.write(chunk)
+                    if on_progress:
+                        on_progress(done, total or None)
+        except _CobaltTooBig:
+            dest.unlink(missing_ok=True)
+            raise
+        except Exception:
+            dest.unlink(missing_ok=True)
+            raise
+
+    if not dest.exists() or dest.stat().st_size == 0:
+        raise _CobaltError("error.api.bad_response")
+    return dest
+
+
+def _cobalt_ladder(mode: str) -> list[str]:
+    if mode == "audio":
+        return ["1080"]  # качество не важно: cobalt отдаёт mp3
+    start = (COBALT_QUALITY or "1080").strip().lower()
+    if start not in _COBALT_LADDER:
+        start = "1080"
+    return list(_COBALT_LADDER[_COBALT_LADDER.index(start):])
+
+
+def _cobalt_info(path: Path, url: str, data: dict) -> dict:
+    output = data.get("output") if isinstance(data.get("output"), dict) else {}
+    meta = output.get("metadata") if isinstance(output.get("metadata"), dict) else {}
+    return {
+        "title": str(meta.get("title") or path.stem),
+        "uploader": str(meta.get("artist") or ""),
+        "duration": 0,
+        "webpage_url": url,
+    }
+
+
+_COBALT_HINTS = (
+    ("content.post.private", "пост приватный — инстансу нужны cookies."),
+    (".private", "контент приватный — инстансу нужны cookies."),
+    ("content.post.age", "контент 18+ — инстансу нужны cookies."),
+    (".age", "контент 18+ — инстансу нужны cookies."),
+    ("content.video.region", "заблокировано в регионе инстанса."),
+    (".region", "заблокировано в регионе инстанса."),
+    ("content.too_long", "слишком длинное видео для инстанса."),
+    ("fetch.short_link", "не удалось раскрыть короткую ссылку."),
+    (".live", "прямые трансляции не поддерживаются."),
+    ("service.unsupported", "этот инстанс не умеет такой сервис."),
+    ("rate_exceeded", "инстанс ограничил частоту запросов — подождите минуту."),
+    (".login", "сервис требует вход — инстансу нужны cookies аккаунта."),
+)
+
+
+def _cobalt_message(exc: Exception | None, url: str | None = None) -> str:
+    prefix = f"{service_name(url)}: " if url else ""
+    if isinstance(exc, _CobaltTooBig):
+        return (
+            prefix
+            + f"файл больше {MAX_UPLOAD_MB} МБ даже в низком качестве.\n"
+            "Пришлите ссылку покороче или выберите «Только звук»."
+        )
+    if isinstance(exc, _CobaltError):
+        base = exc.code.split(":", 1)[0].strip()
+        text = _COBALT_MESSAGES.get(base)
+        if not text and base.startswith("error.api.connection"):
+            text = _COBALT_MESSAGES["error.api.connection"]
+        if not text:
+            for marker, hint in _COBALT_HINTS:
+                if marker in base:
+                    text = hint
+                    break
+        return prefix + (text or f"cobalt вернул ошибку ({exc.code})")
+    if exc is None:
+        return prefix + "cobalt не смог скачать файл."
+    return prefix + f"cobalt не смог скачать ({str(exc)[:140]})."
+
+
+def _clear_dir(out_dir: Path) -> None:
+    """Убирает недокачанные файлы, чтобы следующая попытка шла с чистого листа."""
+    try:
+        for item in out_dir.iterdir():
+            if item.is_file():
+                item.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _cobalt_download_sync(
+    url: str, out_dir: Path, mode: str = "auto", on_progress=None
+) -> tuple[Path, dict]:
+    instances = _cobalt_instances()
+    if not instances:
+        raise DownloadError(_cobalt_message(_CobaltError("error.api.missing"), url))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    budget = MAX_UPLOAD_MB * 1024 * 1024
+    fallback = "media.mp3" if mode == "audio" else "media.mp4"
+    last: Exception | None = None
+
+    for base, auth in instances:
+        for quality in _cobalt_ladder(mode):
+            try:
+                response = _cobalt_post(base, auth, _cobalt_payload(url, mode, quality))
+                file_url, filename = _cobalt_pick(response)
+                path = _cobalt_fetch(
+                    file_url,
+                    out_dir,
+                    filename or fallback,
+                    auth,
+                    budget,
+                    on_progress,
+                )
+                info = _cobalt_info(path, url, response)
+                log.info("cobalt: %s → %s (%s, %s)", base, path.name, mode, quality)
+                return path, info
+            except _CobaltTooBig:
+                last = _CobaltTooBig()
+                log.info("cobalt: %s не влез в лимит на качестве %s", base, quality)
+                _clear_dir(out_dir)
+                continue
+            except _CobaltError as exc:
+                last = exc
+                log.warning("cobalt: %s (%s): %s", base, quality, exc.code)
+                _clear_dir(out_dir)
+                break  # ключ/контент — качество не поможет, сразу следующий инстанс
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                log.warning("cobalt: %s: %s", base, exc)
+                _clear_dir(out_dir)
+                break
+
+    raise DownloadError(_cobalt_message(last, url))
 
 
 # Слова-маркеры «не оригинала»: каверы, ремиксы и ускорения не должны лезть
@@ -1342,21 +1759,31 @@ async def search(query: str, limit: int = 12, budget: float | None = None) -> li
 # ---------------------------------------------------------------- скачивание
 
 
-def _progress_hook(on_progress):
+class _TooBig(Exception):
+    """Файл превысил лимит Telegram во время скачивания."""
+
+
+def _progress_hook(on_progress, limit: int | None = None):
     """Мост между потоком yt-dlp и прогресс-баром в сообщении."""
-    if on_progress is None:
+    if on_progress is None and limit is None:
         return []
 
     def hook(data: dict) -> None:
         status = data.get("status")
         if status == "downloading":
             done = int(data.get("downloaded_bytes") or 0)
+            if limit and done > limit:
+                raise _TooBig()
             total = data.get("total_bytes") or data.get("total_bytes_estimate")
-            on_progress(done, int(total) if total else None)
+            if on_progress:
+                on_progress(done, int(total) if total else None)
         elif status == "finished":
             done = int(data.get("downloaded_bytes") or data.get("total_bytes") or 0)
-            total = int(data.get("total_bytes") or done) or None
-            on_progress(done, total)
+            if limit and done > limit:
+                raise _TooBig()
+            if on_progress:
+                total = int(data.get("total_bytes") or done) or None
+                on_progress(done, total)
 
     return [hook]
 
@@ -1366,8 +1793,26 @@ def _download_audio_sync(
 ) -> tuple[Path, dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if track.provider == "yt" or is_youtube(track.url):
-        raise DownloadError(YOUTUBE_DISABLED)
+    cobalt_error: str | None = None
+    target = _public_url(track.url)
+    if track.provider == "yt" or _use_cobalt(target):
+        if track.provider == "yt" or is_youtube(target):
+            # YouTube: сначала cobalt (как в cobold), потом обычный yt-dlp
+            track = Track(
+                provider="yt",
+                video_id=track.video_id,
+                url=target,
+                title=track.title,
+                uploader=track.uploader,
+                duration=track.duration,
+            )
+        if _cobalt_instances() and _use_cobalt(track.url):
+            try:
+                return _cobalt_download_sync(track.url, out_dir, "audio", on_progress)
+            except DownloadError as exc:
+                cobalt_error = str(exc)
+                log.warning("cobalt (аудио) не осилил %s: %s", track.url, exc)
+                _clear_dir(out_dir)
 
     if track.provider == "hm":
         return _hitmo_download_sync(track, out_dir, on_progress)
@@ -1402,7 +1847,12 @@ def _download_audio_sync(
             data = ydl.extract_info(_public_url(url), download=True)
             return ydl.sanitize_info(data) if data else {}
 
-    info = _dns_retry(_fetch)
+    try:
+        info = _dns_retry(_fetch)
+    except Exception as exc:
+        if cobalt_error and _yt_bot_check(exc):
+            raise DownloadError(cobalt_error) from exc
+        raise
 
     mp3_files = sorted(out_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
     if mp3_files:
@@ -1460,27 +1910,31 @@ def _size_fits(info: dict, max_height: int, budget: int) -> bool | None:
 def _format_candidates(info: dict, budget: int) -> list[str]:
     """Список форматов от лучшего к худшему.
 
-    Важно: фильтр ``height<=N`` отбрасывает форматы без метаданных о высоте
-    (частый случай у TikTok), поэтому первым всегда идёт вариант без фильтра.
+    Для Telegram предпочитаем h264 + m4a: такой mp4 проигрывается везде.
+    Фильтр ``height<=N`` отбрасывает форматы без метаданных о высоте (частый
+    случай у TikTok), поэтому для сервисов с неизвестными размерами остаётся
+    вариант без потолка.
     """
-    candidates = ["bv*+ba/b"]
-
     checks = [(cap, _size_fits(info, cap, budget)) for cap in (1080, 720, 480, 360)]
 
     if all(fits is None for _, fits in checks):
-        # размеры вообще неизвестны (TikTok и подобные) — не перебираем кап
-        return ["bv*+ba/b", "b"]
+        # размеры вообще неизвестны — не перебираем кап, режем по ходу скачивания
+        return ["bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b", "b"]
 
-    if checks[0][1]:  # 1080p влезает целиком
-        return ["bv*+ba/b", "b"]
+    candidates: list[str] = []
+    if checks[0][1] is not True:  # 1080p целиком не влезает — сразу с потолком
+        for cap, fits in checks:
+            if fits is False:
+                continue  # не влезает
+            candidates.append(
+                f"bv*[height<={cap}][vcodec^=avc1]+ba[acodec^=mp4a]/"
+                f"bv*[height<={cap}][ext=mp4]+ba[ext=m4a]/"
+                f"bv*[height<={cap}]+ba/b[height<={cap}]/b"
+            )
+            if fits:  # нашли подходящий потолок — ниже смысла нет
+                break
 
-    for cap, fits in checks:
-        if fits is False:
-            continue  # не влезает
-        candidates.append(f"bv*[height<={cap}]+ba/b[height<={cap}]/b")
-        if fits:  # нашли подходящий потолок — ниже смысла нет
-            break
-
+    candidates.append("bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b")
     candidates.append("b[height<=360]/b")
     candidates.append("b")  # последний шанс: любой формат, даже без метаданных о высоте
     return candidates
@@ -2213,10 +2667,19 @@ def _download_media_sync(
 ) -> tuple[Path, dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if is_youtube(url):
-        raise DownloadError(YOUTUBE_DISABLED)
-
     url = _public_url(url)
+
+    # cobalt: YouTube и сервисы из COBALT_SERVICES. Если он не справился —
+    # работает обычный путь yt-dlp. При обоюдной ошибке показываем причину
+    # от cobalt, если yt-dlp упёрся в проверку «я не робот».
+    cobalt_error: str | None = None
+    if _use_cobalt(url):
+        try:
+            return _cobalt_download_sync(url, out_dir, "auto", on_progress)
+        except DownloadError as exc:
+            cobalt_error = str(exc)
+            log.warning("cobalt не осилил %s: %s", url, exc)
+            _clear_dir(out_dir)
 
     # VK: vk.ru → vk.com (yt-dlp понимает посты на стене только на vk.com)
     if _is_vk(url):
@@ -2241,7 +2704,10 @@ def _download_media_sync(
 
     try:
         info = _dns_retry(_probe)
-    except Exception:
+    except Exception as exc:
+        if cobalt_error and _yt_bot_check(exc):
+            raise DownloadError(cobalt_error) from exc
+
         # X: yt-dlp понимает только видео, картинки берём через публичный API
         fallback = _x_media_sync(url, out_dir)
         if fallback:
@@ -2317,6 +2783,7 @@ def _download_media_sync(
 
     budget = MAX_UPLOAD_MB * 1024 * 1024
     last_error: Exception | None = None
+    too_big = False
 
     # 2) пробуем форматы по очереди, пока файл не влезет в лимит Telegram
     for fmt in _format_candidates(info, budget):
@@ -2330,8 +2797,7 @@ def _download_media_sync(
             "merge_output_format": "mp4",
             "playlist_items": "1",
             "outtmpl": str(out_dir / "%(title).80s [%(id)s].%(ext)s"),
-            "max_filesize": budget,
-            "progress_hooks": _progress_hook(on_progress),
+            "progress_hooks": _progress_hook(on_progress, budget),
         }
         try:
             def _fetch():
@@ -2340,6 +2806,11 @@ def _download_media_sync(
                     return ydl.sanitize_info(data) if data else {}
 
             data = _dns_retry(_fetch)
+        except _TooBig:
+            # скачивание прервано на лимите — пробуем качество пониже
+            too_big = True
+            log.info("format %s не влез в %s МБ, понижаю", fmt, MAX_UPLOAD_MB)
+            continue
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             log.warning("format %s failed for %s: %s", fmt, url, exc)
@@ -2347,12 +2818,20 @@ def _download_media_sync(
 
         files = [p for p in out_dir.iterdir() if p.is_file() and not p.name.endswith(".part")]
         if not files:
-            continue  # файл не влез в max_filesize — пробуем качество пониже
+            continue  # файл не влез в лимит — пробуем качество пониже
 
         path = max(files, key=lambda p: p.stat().st_size)
         return path, data
 
+    if too_big:
+        raise DownloadError(
+            f"Файл больше лимита Telegram ({MAX_UPLOAD_MB} МБ) даже в низком качестве.\n"
+            "Пришлите ссылку покороче или выберите «Только звук»."
+        )
+
     if last_error is not None:
+        if cobalt_error and _yt_bot_check(last_error):
+            raise DownloadError(cobalt_error)
         raise DownloadError(friendly_error(last_error, url))
 
     raise DownloadError(

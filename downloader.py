@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import http.cookiejar
 import json
@@ -35,6 +36,7 @@ from config import (
     POT_SERVER,
     PROXY,
     YT_PLAYER_CLIENT,
+    writable_cookie_copy,
 )
 
 log = logging.getLogger(__name__)
@@ -128,7 +130,7 @@ def _opts() -> dict:
         "cachedir": False,
     }
     if COOKIES_FILE:
-        opts["cookiefile"] = COOKIES_FILE
+        opts["cookiefile"] = writable_cookie_copy(COOKIES_FILE)
     if PROXY:
         opts["proxy"] = PROXY
     extractor_args: dict[str, dict[str, list[str]]] = {}
@@ -2848,30 +2850,56 @@ def cookie_login_state() -> str:
     names = {cookie.name for cookie in jar}
     if not names & {"SID", "SAPISID", "__Secure-1PSID", "__Secure-3PSID"}:
         return "вход по cookies: НЕТ — в файле только анонимные cookie"
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(jar),
-    )
+
+    # Спрашиваем у самого YouTube, узнаёт ли он аккаунт по этим cookies.
+    # Обычная страница /account не годится: для неё нужны cookies домена
+    # .google.com, а боту хватает youtube.com — получилось бы ложное «НЕТ».
+    sid = ""
+    for cookie in jar:
+        if cookie.name in ("SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"):
+            sid = cookie.value
+            break
+    if not sid:
+        return "вход по cookies: НЕТ — нет SAPISID (файл неполный)"
+    stamp = str(int(time.time()))
+    digest = hashlib.sha1(
+        f"{stamp} {sid} https://www.youtube.com".encode()
+    ).hexdigest()
+    client_version = "2.20260101.00.00"
+    body = json.dumps(
+        {"context": {"client": {
+            "clientName": "WEB", "clientVersion": client_version,
+            "hl": "en", "gl": "US",
+        }}}
+    ).encode()
     request = urllib.request.Request(
-        "https://www.youtube.com/account",
+        "https://www.youtube.com/youtubei/v1/account/account_menu"
+        "?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false",
+        data=body,
         headers={
+            "Content-Type": "application/json",
+            "X-YouTube-Client-Name": "1",
+            "X-YouTube-Client-Version": client_version,
+            "Origin": "https://www.youtube.com",
+            "Authorization": f"SAPISIDHASH {stamp}_{digest}",
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
             ),
-            "Accept-Language": "en-US,en;q=0.9",
         },
     )
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     try:
         with opener.open(request, timeout=12) as response:
-            final = response.geturl()
+            text = response.read().decode("utf-8", "replace")
     except Exception as exc:  # noqa: BLE001
         return f"вход по cookies: проверить не удалось ({type(exc).__name__})"
-    if "accounts.google.com" in final:
-        return (
-            "вход по cookies: НЕТ — YouTube отправляет на страницу входа, "
-            "cookies протухли или неполные"
-        )
-    return "вход по cookies: есть"
+    if "accountName" in text:
+        return "вход по cookies: есть"
+    return (
+        "вход по cookies: НЕТ — YouTube не узнал аккаунт, "
+        "cookies протухли или неполные"
+    )
 
 
 def js_runtime_report() -> str:

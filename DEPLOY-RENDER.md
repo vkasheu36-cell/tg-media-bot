@@ -118,6 +118,15 @@ __Secure-1PSID, __Secure-3PSID`, строка с `deno`, `вход по cookies:
 HttpOnly-пар). Пересоберите его через `yt_dlp --cookies-from-browser …` из
 браузера, где вы реально вошли в YouTube, и загрузите заново.
 
+Secret File на Render смонтирован только для чтения, а yt-dlp обновляет cookies
+после каждого запроса. Бот сам копирует файл в `/tmp` при старте и работает с
+копией, поэтому ошибки `Read-only file system: /etc/secrets/cookies.txt` быть
+не должно. После замены Secret File нужен перезапуск сервиса.
+
+Признак, что исправление на месте — строка в логе при старте:
+`cookies: /tmp/cookies-runtime.txt (3xxx байт)`. Если там снова `/etc/secrets/...`,
+значит задеплоена старая сборка.
+
 Если после живых cookies всё равно «Sign in to confirm you're not a bot» —
 значит Google блокирует сам IP Render: тогда нужен прокси (`PROXY`) или
 PO-токены (провайдер `POT_SERVER`).

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,6 +16,24 @@ BOT_TOKEN: str = (os.getenv("BOT_TOKEN") or "").strip()
 
 # Необязательно: путь к cookies.txt (YouTube, Instagram, TikTok и т.д.)
 COOKIES_FILE: str | None = (os.getenv("COOKIES_FILE") or "").strip() or None
+
+
+def writable_cookie_copy(path: str) -> str:
+    """yt-dlp перезаписывает cookie-файл после запроса, а Secret File на Render
+    доступен только на чтение (/etc/secrets). Делаем рабочую копию в /tmp."""
+    source = Path(path)
+    if not source.exists() or os.access(source, os.W_OK):
+        return path
+    target = Path(tempfile.gettempdir()) / "cookies-runtime.txt"
+    try:
+        target.write_bytes(source.read_bytes())
+    except OSError:
+        return path
+    return str(target)
+
+
+if COOKIES_FILE:
+    COOKIES_FILE = writable_cookie_copy(COOKIES_FILE)
 
 # Необязательно: содержимое cookies.txt целиком, если файл положить некуда
 # (PaaS вроде Render: диск временный, зато есть переменные окружения).

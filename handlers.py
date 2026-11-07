@@ -406,13 +406,25 @@ async def cmd_fa_debug(message: Message) -> None:
     except Exception as exc:  # noqa: BLE001
         report = f"{type(exc).__name__}: {exc}"
     text = html.escape(report)
-    if len(text) > 3900:
-        text = text[:3900] + "…"
-    body = f"<pre>{text}</pre>"
+    # Диагностика бывает длиннее лимита Telegram: режем по строкам и шлём
+    # несколькими сообщениями, чтобы «Итог» в конце не потерялся.
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if len(current) + len(line) > 3800:
+            chunks.append(current)
+            current = ""
+        current += line
+    if current:
+        chunks.append(current)
+    chunks = chunks or [""]
+    body = f"<pre>{chunks[0]}</pre>"
     try:
         await status.edit_text(body)
     except Exception:  # noqa: BLE001
         await message.answer(body)
+    for chunk in chunks[1:]:
+        await message.answer(f"<pre>{chunk}</pre>")
 
 
 @router.message(Command("yt_debug"))
@@ -438,13 +450,25 @@ async def cmd_yt_debug(message: Message) -> None:
     except Exception as exc:  # noqa: BLE001
         report = f"{type(exc).__name__}: {exc}"
     text = html.escape(report)
-    if len(text) > 3900:
-        text = text[:3900] + "…"
-    body = f"<pre>{text}</pre>"
+    # Диагностика бывает длиннее лимита Telegram: режем по строкам и шлём
+    # несколькими сообщениями, чтобы «Итог» в конце не потерялся.
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if len(current) + len(line) > 3800:
+            chunks.append(current)
+            current = ""
+        current += line
+    if current:
+        chunks.append(current)
+    chunks = chunks or [""]
+    body = f"<pre>{chunks[0]}</pre>"
     try:
         await status.edit_text(body)
     except Exception:  # noqa: BLE001
         await message.answer(body)
+    for chunk in chunks[1:]:
+        await message.answer(f"<pre>{chunk}</pre>")
 
 
 def _start_kb() -> InlineKeyboardMarkup:

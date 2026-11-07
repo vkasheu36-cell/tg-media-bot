@@ -158,6 +158,7 @@ _YT_CLIENT_LADDER = (
     # web_embedded отдаёт полный набор форматов и с cookies, и без них;
     # visionos хорош без cookies; tv сейчас почти всегда требует PO-токен.
     "web_embedded",
+    "tv_samsung",
     "visionos",
     "android_vr",
     "mweb",
@@ -2937,8 +2938,144 @@ def js_runtime_report() -> str:
     )
 
 
+class _YtDiagLogger:
+    """Собирает пояснения yt-dlp, которые обычно скрыты из-за no_warnings.
+
+    Без этого при отказе видно только «Failed to extract any player response»,
+    а настоящая причина (Sign in to confirm you're not a bot, Incomplete data,
+    HTTP 403/429 и т.п.) отбрасывается как предупреждение.
+    """
+
+    _KEYS = (
+        "playability", "sign in", "not a bot", "po token", "po_token",
+        "player response", "incomplete data", "http error", "403", "429",
+        "consent", "not available", "unavailable", "blocked", "requires",
+        "failed to", "no video formats",
+    )
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def _push(self, message: object) -> None:
+        text = " ".join(str(message or "").split())
+        if not text:
+            return
+        low = text.lower()
+        if low.startswith(("error:", "warning:")) or "po token cache" in low:
+            return
+        if any(key in low for key in self._KEYS) and text not in self.messages:
+            self.messages.append(text[:240])
+
+    def debug(self, message: object) -> None:
+        self._push(message)
+
+    info = debug
+
+    def warning(self, message: object) -> None:
+        self._push(message)
+
+    def error(self, message: object) -> None:
+        self._push(message)
+
+
+_EGRESS_CACHE: str | None = None
+
+
+def _egress_report() -> str:
+    """Внешний IP сервера: видно, ходит ли Render через IPv6 и чей это адрес."""
+    global _EGRESS_CACHE
+    if _EGRESS_CACHE is not None:
+        return _EGRESS_CACHE
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; tg-media-bot)"}
+    parts: list[str] = []
+    for name, url in (
+        ("IPv4", "https://api.ipify.org?format=json"),
+        ("IPv6", "https://api64.ipify.org?format=json"),
+    ):
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8", "replace"))
+            parts.append(f"{name}: {data.get('ip') or '?'}")
+        except Exception:  # noqa: BLE001
+            parts.append(f"{name}: ?")
+    try:
+        request = urllib.request.Request(
+            "https://ipinfo.io/json", headers=headers
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+        extra = ", ".join(
+            str(data[key]) for key in ("country", "org") if data.get(key)
+        )
+        if extra:
+            parts.append(extra)
+    except Exception:  # noqa: BLE001
+        pass
+    _EGRESS_CACHE = "IP сервера: " + " | ".join(parts)
+    return _EGRESS_CACHE
+
+
+def _yt_page_probe(video_id: str) -> str:
+    """Что отдаёт YouTube на обычные страницы с IP сервера (без yt-dlp)."""
+    if not video_id:
+        return "страницы YouTube: не удалось выделить id видео"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    handlers = []
+    if COOKIES_FILE and Path(COOKIES_FILE).exists():
+        try:
+            jar = http.cookiejar.MozillaCookieJar(str(COOKIES_FILE))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            handlers.append(urllib.request.HTTPCookieProcessor(jar))
+        except Exception:  # noqa: BLE001
+            pass
+    opener = urllib.request.build_opener(*handlers)
+    parts: list[str] = []
+    for name, url in (
+        ("watch", f"https://www.youtube.com/watch?v={video_id}"),
+        ("embed", f"https://www.youtube.com/embed/{video_id}?html5=1"),
+    ):
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with opener.open(request, timeout=15) as response:
+                status = response.status
+                page = response.read(1_500_000).decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            parts.append(f"{name}: HTTP {exc.code}")
+            continue
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"{name}: ошибка {type(exc).__name__}")
+            continue
+        flags: list[str] = []
+        if "ytInitialPlayerResponse" in page:
+            flags.append("player есть")
+        if '"visitorData"' in page:
+            flags.append("visitor есть")
+        if '"LOGGED_IN":true' in page or '"isSignedIn":true' in page:
+            flags.append("вход виден")
+        low = page.lower()
+        if "confirm you" in low and "not a bot" in low:
+            flags.append("ТРЕБУЕТ «не робот»")
+        match = re.search(
+            r'"playabilityStatus":\{[^{}]*?"status":"([A-Z_]+)"', page
+        )
+        if match:
+            flags.append(f"playability {match.group(1)}")
+        detail = ", ".join(flags) or "без признаков плеера"
+        parts.append(f"{name}: HTTP {status}, {len(page) // 1024} КБ, {detail}")
+    return "страницы YouTube: " + " | ".join(parts)
+
+
 def _yt_diagnose_sync(url: str) -> str:
     """Проверяет, какой player_client YouTube пускает с IP Render."""
+    match = _YT_ID_RE.search(url)
+    video_id = match.group(1) if match else ""
     lines = [
         f"yt-dlp: {yt_dlp.version.__version__}",
         _cookie_report(),
@@ -2948,6 +3085,8 @@ def _yt_diagnose_sync(url: str) -> str:
         f"POT_SERVER: {'есть' if POT_SERVER else 'нет'}",
         f"PROXY: {'есть' if PROXY else 'нет'}",
         f"рабочий клиент в памяти: {_yt_client or '—'}",
+        _egress_report(),
+        _yt_page_probe(video_id),
         "",
     ]
     clients = list(_YT_CLIENT_LADDER)
@@ -2956,46 +3095,92 @@ def _yt_diagnose_sync(url: str) -> str:
         if chunk and chunk not in clients:
             clients.insert(0, chunk)
     ok_clients: list[str] = []
-    for client in clients:
+    seen_notes: set[str] = set()
+
+    def try_client(client: str, extra: dict | None = None, label: str = "") -> bool:
+        logger = _YtDiagLogger()
         opts = _yt_client_opts(client) | {
             "skip_download": True,
             "socket_timeout": 12,
             "extractor_retries": 1,
             "retries": 1,
+            "verbose": True,
+            "logger": logger,
         }
+        if extra:
+            opts.update(extra)
+        name = f"{client}{label}"
         try:
             info = _extract_info(url, opts)
         except Exception as exc:  # noqa: BLE001
             message = str(exc).replace("\n", " ")
-            lines.append(f"{client}: ошибка — {message[:130]}")
-            continue
+            lines.append(f"{name}: ошибка — {message[:120]}")
+            shown = 0
+            for note in logger.messages:
+                key = note[:80]
+                if key in seen_notes:
+                    continue
+                seen_notes.add(key)
+                lines.append(f"    └ {note[:150]}")
+                shown += 1
+                if shown >= 2:
+                    break
+            return False
         formats = info.get("formats") or []
         heights = [f.get("height") for f in formats if f.get("height")]
         title = (info.get("title") or "")[:45]
-        ok_clients.append(client)
+        ok_clients.append(name)
         lines.append(
-            f"{client}: OK — {title} | форматов {len(formats)}, "
+            f"{name}: OK — {title} | форматов {len(formats)}, "
             f"макс {max(heights) if heights else '?'}p"
         )
+        return True
+
+    for client in clients:
+        try_client(client)
+
+    if not ok_clients:
+        lines.append("")
+        lines.append("повтор только по IPv4:")
+        for client in ("web_embedded", "tv_samsung"):
+            try_client(client, {"force_ipv4": True}, " (IPv4)")
+
+    if not ok_clients and COOKIES_FILE:
+        lines.append("")
+        lines.append("без cookies:")
+        try_client("web_embedded", {"cookiefile": None}, " (без cookies)")
+
     lines.append("")
+    lines.append("после проверки — " + _cookie_report())
     if ok_clients:
         lines.append("Итог: работают — " + ", ".join(ok_clients))
     else:
         lines.append("Итог: ни один клиент не ответил.")
-        if any("sign in to confirm" in line.lower() for line in lines):
-            lines.append(
-                "YouTube требует вход: IP сервера помечен как бот. Нужны cookies "
-                "с живым входом — строка «вход по cookies» выше должна быть «есть»."
-            )
+        login_ok = any(line.startswith("вход по cookies: есть") for line in lines)
+        bot_check = any(
+            "sign in to confirm" in line.lower() or "not a bot" in line.lower()
+            for line in lines
+        )
         if "НЕТ" in js_runtime_report():
             lines.append(
                 "На сервере нет JS-движка — с cookies YouTube почти всегда "
                 "отказывает. В образе должен быть Deno (см. Dockerfile)."
             )
-        if COOKIES_FILE:
+        elif bot_check and login_ok:
             lines.append(
-                "Cookies заданы, но могут быть неполными или протухшими — "
-                "попробуйте убрать их и повторить /yt_debug."
+                "Cookies рабочие, но YouTube требует вход — IP сервера помечен "
+                "как бот. Это блокировка датацентра: нужен прокси (PROXY) или "
+                "PO-токен-провайдер (POT_SERVER)."
+            )
+        elif bot_check:
+            lines.append(
+                "YouTube требует вход, а cookies не входят в аккаунт — "
+                "пересоберите cookies из браузера с живым входом."
+            )
+        elif login_ok:
+            lines.append(
+                "Вход по cookies работает, но YouTube не отдаёт плеер с этого IP. "
+                "Помогает прокси (PROXY) или PO-токен-провайдер (POT_SERVER)."
             )
     return "\n".join(lines)
 

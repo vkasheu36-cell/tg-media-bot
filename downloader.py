@@ -132,7 +132,9 @@ def _opts() -> dict:
     if PROXY:
         opts["proxy"] = PROXY
     extractor_args: dict[str, dict[str, list[str]]] = {}
-    clients = _yt_client or YT_PLAYER_CLIENT
+    # С cookies клиенты по умолчанию упираются в PO-токен, а web_embedded
+    # отдаёт полный набор форматов — поэтому с авторизацией он идёт первым.
+    clients = _yt_client or YT_PLAYER_CLIENT or ("web_embedded" if COOKIES_FILE else "")
     if clients:
         extractor_args["youtube"] = {
             "player_client": [c.strip() for c in clients.split(",") if c.strip()]
@@ -151,8 +153,9 @@ def _opts() -> dict:
 # умолчанию. Перебираем клиентов, пока какой-нибудь не ответит, и запоминаем
 # рабочий на процесс — чтобы следующие ссылки качались сразу через него.
 _YT_CLIENT_LADDER = (
-    # visionos отдаёт полный набор форматов без PO-токена; tv сейчас почти
-    # всегда требует токен и отвечает «The page needs to be reloaded».
+    # web_embedded отдаёт полный набор форматов и с cookies, и без них;
+    # visionos хорош без cookies; tv сейчас почти всегда требует PO-токен.
+    "web_embedded",
     "visionos",
     "android_vr",
     "mweb",
@@ -2830,6 +2833,47 @@ def _cookie_report() -> str:
     )
 
 
+def cookie_login_state() -> str:
+    """Реально ли cookies вводят в аккаунт: YouTube перекидывает на вход или нет."""
+    if not COOKIES_FILE:
+        return "вход по cookies: cookies не заданы"
+    path = Path(COOKIES_FILE)
+    if not path.exists():
+        return "вход по cookies: файла нет"
+    try:
+        jar = http.cookiejar.MozillaCookieJar(str(path))
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except Exception as exc:  # noqa: BLE001
+        return f"вход по cookies: файл не разобрать ({type(exc).__name__})"
+    names = {cookie.name for cookie in jar}
+    if not names & {"SID", "SAPISID", "__Secure-1PSID", "__Secure-3PSID"}:
+        return "вход по cookies: НЕТ — в файле только анонимные cookie"
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar),
+    )
+    request = urllib.request.Request(
+        "https://www.youtube.com/account",
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+    try:
+        with opener.open(request, timeout=12) as response:
+            final = response.geturl()
+    except Exception as exc:  # noqa: BLE001
+        return f"вход по cookies: проверить не удалось ({type(exc).__name__})"
+    if "accounts.google.com" in final:
+        return (
+            "вход по cookies: НЕТ — YouTube отправляет на страницу входа, "
+            "cookies протухли или неполные"
+        )
+    return "вход по cookies: есть"
+
+
 def js_runtime_report() -> str:
     """Есть ли JS-движок и скрипт n-challenge.
 
@@ -2870,6 +2914,7 @@ def _yt_diagnose_sync(url: str) -> str:
     lines = [
         f"yt-dlp: {yt_dlp.version.__version__}",
         _cookie_report(),
+        cookie_login_state(),
         js_runtime_report(),
         f"YT_PLAYER_CLIENT: {YT_PLAYER_CLIENT or '—'}",
         f"POT_SERVER: {'есть' if POT_SERVER else 'нет'}",
@@ -2909,6 +2954,11 @@ def _yt_diagnose_sync(url: str) -> str:
         lines.append("Итог: работают — " + ", ".join(ok_clients))
     else:
         lines.append("Итог: ни один клиент не ответил.")
+        if any("sign in to confirm" in line.lower() for line in lines):
+            lines.append(
+                "YouTube требует вход: IP сервера помечен как бот. Нужны cookies "
+                "с живым входом — строка «вход по cookies» выше должна быть «есть»."
+            )
         if "НЕТ" in js_runtime_report():
             lines.append(
                 "На сервере нет JS-движка — с cookies YouTube почти всегда "

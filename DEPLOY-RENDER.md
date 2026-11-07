@@ -111,7 +111,16 @@ player_client и запоминает рабочий. Проверить, что
 5. **Manual Deploy → Clear build cache & deploy**, затем `/yt_debug <ссылка>`.
 
 В отчёте должно быть `ключи входа: SID, HSID, SSID, APISID, SAPISID, LOGIN_INFO,
-__Secure-1PSID, __Secure-3PSID`, строка с `deno` и хотя бы один клиент `OK`.
+__Secure-1PSID, __Secure-3PSID`, строка с `deno`, `вход по cookies: есть`
+и хотя бы один клиент `OK`.
+
+Если `вход по cookies: НЕТ` — файл не рабочий (протух или экспортирован без
+HttpOnly-пар). Пересоберите его через `yt_dlp --cookies-from-browser …` из
+браузера, где вы реально вошли в YouTube, и загрузите заново.
+
+Если после живых cookies всё равно «Sign in to confirm you're not a bot» —
+значит Google блокирует сам IP Render: тогда нужен прокси (`PROXY`) или
+PO-токены (провайдер `POT_SERVER`).
 
 Cookies — это доступ к аккаунту: не публикуйте файл и не пересылайте его в чат.
 

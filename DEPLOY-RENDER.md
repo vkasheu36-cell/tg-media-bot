@@ -32,12 +32,18 @@ Long polling на Render не годится — платформа ждёт о�
    - `COOKIES_FILE` = `/etc/secrets/cookies.txt` (Secret File) — для YouTube и Instagram.
 5. **Create Web Service** и подождать 3–5 минут сборки.
 
+> **Не вставляйте cookies в переменную `YT_COOKIES`.** Linux не принимает
+> аргументы длиннее ~128 КБ, поэтому большой `cookies.txt` (150+ строк) валит
+> сборку сообщением `exec /usr/local/bin/run-buildkit.sh: argument list too long`.
+> Удалите `YT_COOKIES` из Environment и используйте Secret File (см. раздел 5).
+
 В логах должно появиться:
 
 ```
 Подключился как @Vif_media_music_bot
 Вебхук установлен: https://tg-media-bot.onrender.com/webhook
 HTTP-сервер слушает 0.0.0.0:10000
+Бот запущен. … youtube: yt-dlp, JS-движок: deno 2.9.8 …, прокси: нет
 ```
 
 ## 3. Не давать сервису засыпать
@@ -69,10 +75,45 @@ Render — датацентр, и YouTube часто просит «Sign in to c
 именно cookies решают эту проблему. Вернуть YouTube в cobalt можно переменной
 `COBALT_YOUTUBE=1`, но тогда нужен инстанс, который умеет YouTube.
 
+В образе уже есть **Deno** и пакет **yt-dlp-ejs**: yt-dlp решает на JavaScript
+задачу n-challenge, без которой YouTube с cookies отдаёт «Requested format is
+not available» и ни одного формата. Ничего доустанавливать на Render не нужно.
+
 Если в логах «Failed to extract any player response» — бот сам перебирает
 player_client и запоминает рабочий. Проверить, что доступно с IP Render:
 `/yt_debug https://youtu.be/...`. Команда заодно покажет, подхватились ли cookies
-и есть ли в них ключи входа.
+(ключи входа), есть ли JS-движок и какие клиенты ответили.
+
+### Cookies через Secret File
+
+1. Соберите файл из браузера, где вы вошли в YouTube (браузер лучше закрыть):
+
+   ```bash
+   python -m yt_dlp --cookies-from-browser chrome --cookies cookies.txt \
+     --skip-download "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+   ```
+
+   `chrome` можно заменить на `edge`, `firefox`, `brave`, `opera`, `vivaldi`.
+   Экспорт из Cookie-Editor теряет HttpOnly-пары (`SID`, `HSID`, `APISID`),
+   поэтому он хуже.
+
+2. Проверьте состав (значения не печатаются):
+
+   ```bash
+   python inspect_cookies.py cookies.txt
+   ```
+
+3. Render → ваш сервис → **Environment** → **Secret Files** → **Add Secret File**:
+   - **Filename**: `cookies.txt`
+   - **Contents**: весь файл.
+4. В **Environment Variables**: `COOKIES_FILE` = `/etc/secrets/cookies.txt`.
+   Переменную `YT_COOKIES` удалите.
+5. **Manual Deploy → Clear build cache & deploy**, затем `/yt_debug <ссылка>`.
+
+В отчёте должно быть `ключи входа: SID, HSID, SSID, APISID, SAPISID, LOGIN_INFO,
+__Secure-1PSID, __Secure-3PSID`, строка с `deno` и хотя бы один клиент `OK`.
+
+Cookies — это доступ к аккаунту: не публикуйте файл и не пересылайте его в чат.
 
 Instagram/Reddit/Rutube: бот сначала пробует `COBALT_API` (если задан), затем
 обычный yt-dlp. Список сервисов — `COBALT_SERVICES` (по умолчанию

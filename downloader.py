@@ -151,13 +151,15 @@ def _opts() -> dict:
 # умолчанию. Перебираем клиентов, пока какой-нибудь не ответит, и запоминаем
 # рабочий на процесс — чтобы следующие ссылки качались сразу через него.
 _YT_CLIENT_LADDER = (
-    "tv",
+    # visionos отдаёт полный набор форматов без PO-токена; tv сейчас почти
+    # всегда требует токен и отвечает «The page needs to be reloaded».
     "visionos",
     "android_vr",
-    "web_safari",
     "mweb",
-    "ios",
     "tv_simply",
+    "tv",
+    "web_safari",
+    "ios",
     "web",
 )
 _yt_client: str | None = None
@@ -208,6 +210,23 @@ def _extract_with_rescue(url: str, opts: dict, download: bool = False):
     except Exception as exc:  # noqa: BLE001
         if not is_youtube(url) or not _yt_should_retry(exc, download):
             raise
+
+        # Битые или неполные cookies хуже, чем их отсутствие: YouTube видит
+        # «полувход» и требует то, чего у yt-dlp нет. Пробуем тот же запрос без
+        # cookies — если получилось, видео скачается, а не упадёт с ошибкой.
+        if opts.get("cookiefile"):
+            plain = dict(opts)
+            plain.pop("cookiefile", None)
+            plain["extractor_retries"] = 1
+            plain["retries"] = 1
+            plain["socket_timeout"] = 12
+            try:
+                info = _dns_retry(lambda: _extract_info(url, plain, download=download))
+            except Exception as inner:  # noqa: BLE001
+                log.info("YouTube: без cookies тоже не вышло: %s", inner)
+            else:
+                log.warning("YouTube: с cookies не получилось, качаю без них")
+                return info
 
         # клиенты из YT_PLAYER_CLIENT уже пробовались вместе — не повторяем их
         explicit = {c.strip() for c in (YT_PLAYER_CLIENT or "").split(",") if c.strip()}
@@ -2782,7 +2801,16 @@ def _cookie_report() -> str:
         text = path.read_text("utf-8", "replace")
     except OSError as exc:
         return f"cookies: не читаются: {exc}"
-    rows = [line for line in text.splitlines() if line and not line.startswith("#")]
+    rows: list[str] = []
+    for line in text.splitlines():
+        if not line:
+            continue
+        if line.startswith("#HttpOnly_"):
+            # так помечены HttpOnly-cookie — в них лежат SID/HSID/LOGIN_INFO
+            line = line[len("#HttpOnly_") :]
+        elif line.startswith("#"):
+            continue
+        rows.append(line)
     yt_rows = [line for line in rows if "youtube" in line or "google" in line]
     names = set()
     for line in yt_rows:
@@ -2792,13 +2820,48 @@ def _cookie_report() -> str:
     keys = [
         key
         for key in ("SID", "HSID", "SSID", "APISID", "SAPISID", "LOGIN_INFO",
-                    "__Secure-1PSID", "__Secure-3PSID")
+                    "__Secure-1PSID", "__Secure-3PSID", "SIDCC")
         if key in names
     ]
     tail = f", ключи входа: {', '.join(keys)}" if keys else ", ключей входа не видно"
     return (
         f"cookies: {path.name}, {path.stat().st_size} байт, "
-        f"строк youtube/google: {len(yt_rows)}{tail}"
+        f"всего строк: {len(rows)}, youtube/google: {len(yt_rows)}{tail}"
+    )
+
+
+def js_runtime_report() -> str:
+    """Есть ли JS-движок и скрипт n-challenge.
+
+    Без них YouTube отдаёт меньше форматов, а с cookies обычно не отдаёт ничего:
+    ссылки на видео шифруются n-challenge, который надо решать на JS.
+    """
+    runtimes: list[str] = []
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+            found = getattr(ydl, "_js_runtimes", {}) or {}
+    except Exception:  # noqa: BLE001
+        found = {}
+    for runtime in found.values():
+        info = getattr(runtime, "info", None)
+        if info is None:
+            continue
+        mark = "" if getattr(info, "supported", True) else " (версия не поддерживается)"
+        runtimes.append(f"{info.name} {info.version}{mark}")
+    try:
+        import yt_dlp_ejs  # noqa: F401
+    except Exception:  # noqa: BLE001
+        ejs = "нет"
+    else:
+        try:
+            from importlib.metadata import version
+
+            ejs = f"есть {version('yt-dlp-ejs')}"
+        except Exception:  # noqa: BLE001
+            ejs = "есть"
+    return (
+        f"JS-движок: {', '.join(runtimes) if runtimes else 'НЕТ'}; "
+        f"скрипт n-challenge (yt-dlp-ejs): {ejs}"
     )
 
 
@@ -2807,6 +2870,7 @@ def _yt_diagnose_sync(url: str) -> str:
     lines = [
         f"yt-dlp: {yt_dlp.version.__version__}",
         _cookie_report(),
+        js_runtime_report(),
         f"YT_PLAYER_CLIENT: {YT_PLAYER_CLIENT or '—'}",
         f"POT_SERVER: {'есть' if POT_SERVER else 'нет'}",
         f"PROXY: {'есть' if PROXY else 'нет'}",
@@ -2818,6 +2882,7 @@ def _yt_diagnose_sync(url: str) -> str:
         chunk = chunk.strip()
         if chunk and chunk not in clients:
             clients.insert(0, chunk)
+    ok_clients: list[str] = []
     for client in clients:
         opts = _yt_client_opts(client) | {
             "skip_download": True,
@@ -2834,10 +2899,26 @@ def _yt_diagnose_sync(url: str) -> str:
         formats = info.get("formats") or []
         heights = [f.get("height") for f in formats if f.get("height")]
         title = (info.get("title") or "")[:45]
+        ok_clients.append(client)
         lines.append(
             f"{client}: OK — {title} | форматов {len(formats)}, "
             f"макс {max(heights) if heights else '?'}p"
         )
+    lines.append("")
+    if ok_clients:
+        lines.append("Итог: работают — " + ", ".join(ok_clients))
+    else:
+        lines.append("Итог: ни один клиент не ответил.")
+        if "НЕТ" in js_runtime_report():
+            lines.append(
+                "На сервере нет JS-движка — с cookies YouTube почти всегда "
+                "отказывает. В образе должен быть Deno (см. Dockerfile)."
+            )
+        if COOKIES_FILE:
+            lines.append(
+                "Cookies заданы, но могут быть неполными или протухшими — "
+                "попробуйте убрать их и повторить /yt_debug."
+            )
     return "\n".join(lines)
 
 

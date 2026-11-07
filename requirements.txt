@@ -1,5 +1,7 @@
 aiogram>=3.15,<4
 aiohttp-socks>=0.8
 yt-dlp>=2025.1.15
+# скрипт решения n-challenge: без него YouTube с cookies не отдаёт форматы
+yt-dlp-ejs>=0.8.0
 python-dotenv>=1.0.1
 mutagen>=1.47.0

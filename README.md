@@ -242,11 +242,49 @@ Instagram и Reddit на публичных инстансах тоже част
 
 **Если YouTube пишет «Failed to extract any player response».** Это значит, что
 YouTube не отдал плеер ни одному клиенту: обычно виноват датацентровый IP Render
-или протухшие cookies. Бот сам перебирает клиентов (`tv`, `visionos`,
-`android_vr`, `mweb` и другие) и запоминает рабочий. Команда
+или неполные cookies. Бот сам перебирает клиентов (`visionos`, `android_vr`,
+`mweb`, `tv_simply` и другие) и запоминает рабочий. Команда
 `/yt_debug https://youtu.be/...` показывает, какие клиенты отвечают с вашего
 сервера, и заодно проверяет cookies. Если не работает ни один — нужен прокси,
 свежие cookies или свой cobalt с PO-токенами.
+
+**Как получить cookies YouTube.** Не копируйте значения вручную: экспорт из
+Cookie-Editor часто теряет HttpOnly-пары (`SID`, `HSID`, `APISID`), и с таким
+файлом YouTube отвечает хуже, чем вообще без cookies. Надёжнее собрать файл
+через yt-dlp из браузера, где вы вошли в YouTube (браузер лучше закрыть):
+
+```bash
+python -m yt_dlp --cookies-from-browser chrome --cookies cookies.txt \
+  --skip-download "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
+`chrome` можно заменить на `edge`, `firefox`, `brave`, `opera`, `vivaldi`.
+Полученный `cookies.txt` загрузите на Render как **Secret File** с именем
+`cookies.txt` и укажите `COOKIES_FILE=/etc/secrets/cookies.txt`. Переменную
+`YT_COOKIES` при этом уберите: многострочная вставка часто ломает табы.
+
+Проверка состава (значения не печатаются):
+
+```bash
+python inspect_cookies.py cookies.txt
+```
+
+Должны быть `SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `LOGIN_INFO`
+и `__Secure-1PSID`/`__Secure-3PSID`.
+
+**Нужен JS-движок.** Свежих cookies мало: YouTube шифрует ссылки на файлы
+(n-challenge), и yt-dlp должен решать эту задачу на JavaScript. В Docker-образе
+уже стоит Deno и пакет `yt-dlp-ejs`, поэтому на Render всё работает из коробки.
+Если запускаете локально — поставьте их и себе, иначе с cookies будет
+«Requested format is not available», а без cookies форматов меньше:
+
+```bash
+pip install yt-dlp-ejs
+# Deno: https://deno.com/ или winget install DenoLand.Deno
+```
+
+Проверить, что движок виден, можно командой `/yt_debug <ссылка>` — в отчёте
+будет строка `JS-движок: deno 2.x ...; скрипт n-challenge (yt-dlp-ejs): есть 0.8.0`.
 
 Музыку это не задевает: Hitmo и Zvyki отдают готовые файлы напрямую, без обходов.
 

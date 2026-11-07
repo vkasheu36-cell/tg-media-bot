@@ -30,6 +30,7 @@ from config import (
     TELEGRAM_PROXY,
     WEBHOOK_SECRET,
 )
+from downloader import js_runtime_report
 from handlers import router
 from inline import router as inline_router
 
@@ -121,13 +122,14 @@ async def main() -> None:
     storage.cleanup()
     log.info(
         "Бот запущен. Лимит отправки: %s МБ, ffmpeg: %s, cookies: %s, "
-        "cobalt: %s (%s), youtube: %s, прокси: %s",
+        "cobalt: %s (%s), youtube: %s, %s, прокси: %s",
         MAX_UPLOAD_MB,
         FFMPEG_DIR or "не найден",
         "есть" if COOKIES_FILE else "нет",
         "есть" if COBALT_API else "нет",
         COBALT_SERVICES or "—",
         "cobalt" if (COBALT_API and COBALT_YOUTUBE) else "yt-dlp",
+        js_runtime_report(),
         TELEGRAM_PROXY or "нет",
     )
 

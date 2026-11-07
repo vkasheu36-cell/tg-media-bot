@@ -23,8 +23,10 @@ _YT_COOKIES = (os.getenv("YT_COOKIES") or "").strip()
 if _YT_COOKIES and not COOKIES_FILE:
     try:
         _cookies_path = BASE_DIR / "cookies.txt"
+        # Render может прислать \r\n; cookie-парсер ждёт обычные \n и табы.
+        _content = _YT_COOKIES.replace("\r\n", "\n").replace("\r", "\n")
         _cookies_path.write_text(
-            _YT_COOKIES.replace("\\n", "\n").rstrip("\n") + "\n", encoding="utf-8"
+            _content.replace("\\n", "\n").rstrip("\n") + "\n", encoding="utf-8"
         )
         COOKIES_FILE = str(_cookies_path)
     except OSError:

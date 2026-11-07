@@ -111,7 +111,7 @@ python bot.py
   ```
 - либо держать бота на зарубежном сервере (Oracle и т.п.) — там блокировки нет.
 
-`PROXY` (для yt-dlp) и `TELEGRAM_PROXY` задаются отдельно: YouTube может быть доступен напрямую, а Telegram — нет, и наоборот.
+`PROXY` (для yt-dlp), `YT_PROXY` (только YouTube) и `TELEGRAM_PROXY` задаются отдельно: YouTube может быть доступен напрямую, а Telegram — нет, и наоборот.
 
 ---
 
@@ -131,6 +131,9 @@ python bot.py
 | `POT_SERVER` | нет | адрес локального провайдера PO-токенов (bgutil) для yt-dlp |
 | `TELEGRAM_PROXY` | нет | прокси для Bot API, `socks5://127.0.0.1:1080` (если Telegram заблокирован) |
 | `PROXY` | нет | прокси для yt-dlp: `socks5://127.0.0.1:1080` или `http://user:pass@host:port` |
+| `YT_PROXY` | нет | прокси только для YouTube/yt-dlp (важнее `PROXY`) |
+| `WARP` | нет | Docker/Render: `1` (по умолчанию) — поднять Cloudflare WARP для YouTube, `0` — выключить |
+| `USQUE_CONFIG` | нет | путь к готовому `config.json` usque (например, Render Secret File) |
 | `MAX_UPLOAD_MB` | нет | лимит файла, по умолчанию 49 (максимум Bot API — 50) |
 
 ---
@@ -186,7 +189,7 @@ journalctl -u tg-media-bot -f      # живые логи
 
 ### Если Oracle не подошёл
 
-- **Render (бесплатно, без карты)** — пошаговая инструкция в `DEPLOY-RENDER.md`: код в GitHub → Web Service из `Dockerfile` → вебхук ставится автоматически, плюс бесплатный пингер, чтобы контейнер не засыпал.
+- **Render (бесплатно, без карты)** — пошаговая инструкция в `DEPLOY-RENDER.md`: код в GitHub → Web Service из `Dockerfile` → вебхук ставится автоматически, плюс бесплатный пингер, чтобы контейнер не засыпал. В образе поднимается Cloudflare WARP (через `usque`, TCP/HTTP2), потому что YouTube блокирует IP датацентров.
 - **Любой дешёвый VPS** (Hetzner CX22 ~€4, Aeza, Timeweb Cloud, Racknerd) — те же команды, только загрузить файлы через `scp`.
 - **Docker** на любом сервере:
   ```bash
@@ -245,7 +248,8 @@ YouTube не отдал плеер ни одному клиенту: обычн�
 или неполные cookies. Бот сам перебирает клиентов (`web_embedded`, `visionos`,
 `android_vr`, `mweb` и другие) и запоминает рабочий. Команда
 `/yt_debug https://youtu.be/...` показывает, какие клиенты отвечают с вашего
-сервера, и заодно проверяет cookies. Если не работает ни один — нужен прокси,
+сервера, и заодно проверяет cookies. Если не работает ни один — нужен прокси
+(в Docker-образе это WARP, переменная `WARP=1`; вручную — `YT_PROXY`),
 свежие cookies или свой cobalt с PO-токенами.
 
 **Как получить cookies YouTube.** Не копируйте значения вручную: экспорт из

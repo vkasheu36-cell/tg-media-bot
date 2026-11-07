@@ -36,6 +36,7 @@ from config import (
     POT_SERVER,
     PROXY,
     YT_PLAYER_CLIENT,
+    YT_PROXY,
     writable_cookie_copy,
 )
 
@@ -115,6 +116,11 @@ class Track:
     duration: int
 
 
+def _yt_proxy() -> str | None:
+    """Прокси для YouTube: отдельный YT_PROXY важнее общего PROXY."""
+    return YT_PROXY or PROXY
+
+
 def _opts() -> dict:
     """Базовые опции yt-dlp (общие для всех запросов)."""
     opts: dict = {
@@ -131,8 +137,9 @@ def _opts() -> dict:
     }
     if COOKIES_FILE:
         opts["cookiefile"] = writable_cookie_copy(COOKIES_FILE)
-    if PROXY:
-        opts["proxy"] = PROXY
+    proxy = _yt_proxy()
+    if proxy:
+        opts["proxy"] = proxy
     extractor_args: dict[str, dict[str, list[str]]] = {}
     # С cookies клиенты по умолчанию упираются в PO-токен, а web_embedded
     # отдаёт полный набор форматов — поэтому с авторизацией он идёт первым.
@@ -2889,12 +2896,32 @@ def cookie_login_state() -> str:
             ),
         },
     )
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    try:
-        with opener.open(request, timeout=12) as response:
-            text = response.read().decode("utf-8", "replace")
-    except Exception as exc:  # noqa: BLE001
-        return f"вход по cookies: проверить не удалось ({type(exc).__name__})"
+    text = ""
+    if _yt_proxy():
+        # Проверяем вход тем же путём, что качает yt-dlp: с IP Render
+        # account_menu тоже может отдавать 429, а через WARP — 200.
+        try:
+            _, raw = _fetch_via_proxy(
+                request.full_url,
+                timeout=12,
+                headers=dict(request.headers),
+                data=body,
+            )
+            text = raw.decode("utf-8", "replace")
+        except Exception as exc:  # noqa: BLE001
+            return (
+                "вход по cookies: проверить не удалось через прокси "
+                f"({type(exc).__name__})"
+            )
+    if not text:
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(jar)
+        )
+        try:
+            with opener.open(request, timeout=12) as response:
+                text = response.read().decode("utf-8", "replace")
+        except Exception as exc:  # noqa: BLE001
+            return f"вход по cookies: проверить не удалось ({type(exc).__name__})"
     if "accountName" in text:
         return "вход по cookies: есть"
     return (
@@ -2979,6 +3006,84 @@ class _YtDiagLogger:
 
 
 _EGRESS_CACHE: str | None = None
+_CURL_STATUS_MARK = "\n__HTTP_STATUS__"
+
+
+def _proxy_curl_args(proxy: str) -> list[str]:
+    """Аргументы curl для socks5/socks5h/http-прокси (без пароля в логах)."""
+    rest = proxy.split("://", 1)[-1]
+    creds = ""
+    if "@" in rest:
+        creds, rest = rest.rsplit("@", 1)
+    if proxy.lower().startswith("socks"):
+        args = ["--socks5-hostname", rest]
+        if creds:
+            args += ["--proxy-user", creds]
+        return args
+    return ["--proxy", proxy]
+
+
+def _fetch_via_proxy(
+    url: str,
+    timeout: int = 12,
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+) -> tuple[int, bytes]:
+    """GET/POST через прокси из YT_PROXY/PROXY — тем же путём, что ходит yt-dlp.
+
+    curl взят потому, что он умеет socks5h без PySocks: имя домена
+    резолвит туннель, а не датацентровый DNS Render.
+    """
+    proxy = _yt_proxy()
+    if not proxy:
+        raise RuntimeError("прокси не задан")
+    args = [
+        "curl", "-sS", "--compressed", "--max-time", str(timeout),
+        "-A", (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+        ),
+        "-H", "Accept-Language: en-US,en;q=0.9",
+        "-w", _CURL_STATUS_MARK + "%{http_code}",
+    ]
+    for name, value in (headers or {}).items():
+        if name.lower() not in {"user-agent", "content-length", "host", "accept-encoding"}:
+            args += ["-H", f"{name}: {value}"]
+    args += _proxy_curl_args(proxy)
+    if COOKIES_FILE and Path(COOKIES_FILE).exists():
+        args += ["-b", writable_cookie_copy(COOKIES_FILE)]
+    if data is not None:
+        args += ["--data-binary", "@-"]
+    args.append(url)
+    result = subprocess.run(
+        args, input=data, capture_output=True, timeout=timeout + 5
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(detail[:160] or f"curl код {result.returncode}")
+    marker = _CURL_STATUS_MARK.encode()
+    index = result.stdout.rfind(marker)
+    if index < 0:
+        raise RuntimeError("curl не вернул код ответа")
+    status = int(result.stdout[index + len(marker):].strip() or 0)
+    return status, result.stdout[:index]
+
+
+def _proxy_egress_report() -> str | None:
+    """Внешний IP уже через прокси: видно, что туннель действительно работает."""
+    if not _yt_proxy():
+        return None
+    try:
+        status, body = _fetch_via_proxy("https://ipinfo.io/json", timeout=10)
+        data = json.loads(body.decode("utf-8", "replace"))
+        bits = [
+            str(data[key]) for key in ("ip", "country", "org") if data.get(key)
+        ]
+        if not bits:
+            return f"IP через прокси: HTTP {status}, пустой ответ"
+        return "IP через прокси: " + " | ".join(bits)
+    except Exception as exc:  # noqa: BLE001
+        return f"IP через прокси: проверить не удалось ({type(exc).__name__})"
 
 
 def _egress_report() -> str:
@@ -3017,7 +3122,7 @@ def _egress_report() -> str:
 
 
 def _yt_page_probe(video_id: str) -> str:
-    """Что отдаёт YouTube на обычные страницы с IP сервера (без yt-dlp)."""
+    """Что отдаёт YouTube на обычные страницы — напрямую или через прокси."""
     if not video_id:
         return "страницы YouTube: не удалось выделить id видео"
     headers = {
@@ -3036,16 +3141,25 @@ def _yt_page_probe(video_id: str) -> str:
         except Exception:  # noqa: BLE001
             pass
     opener = urllib.request.build_opener(*handlers)
+    via_proxy = bool(_yt_proxy())
+
+    def fetch(url: str) -> tuple[int, str]:
+        if via_proxy:
+            status, body = _fetch_via_proxy(url, timeout=15)
+            return status, body.decode("utf-8", "replace")
+        request = urllib.request.Request(url, headers=headers)
+        with opener.open(request, timeout=15) as response:
+            return response.status, response.read(1_500_000).decode(
+                "utf-8", "replace"
+            )
+
     parts: list[str] = []
     for name, url in (
         ("watch", f"https://www.youtube.com/watch?v={video_id}"),
         ("embed", f"https://www.youtube.com/embed/{video_id}?html5=1"),
     ):
         try:
-            request = urllib.request.Request(url, headers=headers)
-            with opener.open(request, timeout=15) as response:
-                status = response.status
-                page = response.read(1_500_000).decode("utf-8", "replace")
+            status, page = fetch(url)
         except urllib.error.HTTPError as exc:
             parts.append(f"{name}: HTTP {exc.code}")
             continue
@@ -3069,13 +3183,15 @@ def _yt_page_probe(video_id: str) -> str:
             flags.append(f"playability {match.group(1)}")
         detail = ", ".join(flags) or "без признаков плеера"
         parts.append(f"{name}: HTTP {status}, {len(page) // 1024} КБ, {detail}")
-    return "страницы YouTube: " + " | ".join(parts)
+    prefix = "страницы YouTube (через прокси)" if via_proxy else "страницы YouTube"
+    return prefix + ": " + " | ".join(parts)
 
 
 def _yt_diagnose_sync(url: str) -> str:
     """Проверяет, какой player_client YouTube пускает с IP Render."""
     match = _YT_ID_RE.search(url)
     video_id = match.group(1) if match else ""
+    proxy_egress = _proxy_egress_report()
     lines = [
         f"yt-dlp: {yt_dlp.version.__version__}",
         _cookie_report(),
@@ -3084,8 +3200,10 @@ def _yt_diagnose_sync(url: str) -> str:
         f"YT_PLAYER_CLIENT: {YT_PLAYER_CLIENT or '—'}",
         f"POT_SERVER: {'есть' if POT_SERVER else 'нет'}",
         f"PROXY: {'есть' if PROXY else 'нет'}",
+        f"YT_PROXY: {'есть' if YT_PROXY else 'нет'}",
         f"рабочий клиент в памяти: {_yt_client or '—'}",
         _egress_report(),
+        *([proxy_egress] if proxy_egress else []),
         _yt_page_probe(video_id),
         "",
     ]
@@ -3167,21 +3285,34 @@ def _yt_diagnose_sync(url: str) -> str:
                 "отказывает. В образе должен быть Deno (см. Dockerfile)."
             )
         elif bot_check and login_ok:
-            lines.append(
-                "Cookies рабочие, но YouTube требует вход — IP сервера помечен "
-                "как бот. Это блокировка датацентра: нужен прокси (PROXY) или "
-                "PO-токен-провайдер (POT_SERVER)."
-            )
+            if _yt_proxy():
+                lines.append(
+                    "Cookies рабочие, прокси включён, но YouTube всё равно требует "
+                    "вход — выходной IP туннеля тоже помечен как бот. Нужен другой "
+                    "выход WARP/прокси."
+                )
+            else:
+                lines.append(
+                    "Cookies рабочие, но YouTube требует вход — IP сервера помечен "
+                    "как бот. Это блокировка датацентра: в образе помогает WARP "
+                    "(WARP=1), вручную — YT_PROXY."
+                )
         elif bot_check:
             lines.append(
                 "YouTube требует вход, а cookies не входят в аккаунт — "
                 "пересоберите cookies из браузера с живым входом."
             )
         elif login_ok:
-            lines.append(
-                "Вход по cookies работает, но YouTube не отдаёт плеер с этого IP. "
-                "Помогает прокси (PROXY) или PO-токен-провайдер (POT_SERVER)."
-            )
+            if _yt_proxy():
+                lines.append(
+                    "Прокси включён, но YouTube не отдаёт плеер. Проверьте, что "
+                    "туннель живой (строка «IP через прокси» выше), и повторите."
+                )
+            else:
+                lines.append(
+                    "Вход по cookies работает, но YouTube не отдаёт плеер с этого IP. "
+                    "Помогает WARP (WARP=1) или YT_PROXY."
+                )
     return "\n".join(lines)
 
 

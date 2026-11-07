@@ -60,8 +60,14 @@ YT_PLAYER_CLIENT: str = (os.getenv("YT_PLAYER_CLIENT") or "").strip()
 # В контейнере выставляется автоматически из start.sh.
 POT_SERVER: str = (os.getenv("POT_SERVER") or "").strip()
 
-# Необязательно: прокси для yt-dlp, например socks5://127.0.0.1:1080
+# Необязательно: прокси для yt-dlp, например socks5://127.0.0.1:1080.
+# Используется и Telegram, если не задан TELEGRAM_PROXY.
 PROXY: str | None = (os.getenv("PROXY") or "").strip() or None
+
+# Необязательно: прокси только для YouTube/yt-dlp (важнее PROXY).
+# В контейнере сюда подставляется локальный SOCKS5 от Cloudflare WARP
+# (см. start.sh), чтобы Telegram и остальные сервисы шли напрямую.
+YT_PROXY: str | None = (os.getenv("YT_PROXY") or "").strip() or None
 
 # --- cobalt: внешний API для YouTube (опционально) и других сервисов --------
 # Так же, как cobold (tskau/cobold), бот отправляет ссылку в cobalt и забирает

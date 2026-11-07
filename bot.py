@@ -26,9 +26,11 @@ from config import (
     FFMPEG_DIR,
     MAX_UPLOAD_MB,
     PORT,
+    PROXY,
     PUBLIC_URL,
     TELEGRAM_PROXY,
     WEBHOOK_SECRET,
+    YT_PROXY,
 )
 from downloader import js_runtime_report
 from handlers import router
@@ -122,7 +124,7 @@ async def main() -> None:
     storage.cleanup()
     log.info(
         "Бот запущен. Лимит отправки: %s МБ, ffmpeg: %s, cookies: %s, "
-        "cobalt: %s (%s), youtube: %s, %s, прокси: %s",
+        "cobalt: %s (%s), youtube: %s, %s, прокси Telegram: %s, прокси YouTube: %s",
         MAX_UPLOAD_MB,
         FFMPEG_DIR or "не найден",
         "есть" if COOKIES_FILE else "нет",
@@ -131,6 +133,7 @@ async def main() -> None:
         "cobalt" if (COBALT_API and COBALT_YOUTUBE) else "yt-dlp",
         js_runtime_report(),
         TELEGRAM_PROXY or "нет",
+        YT_PROXY or PROXY or "нет",
     )
 
     if PUBLIC_URL:

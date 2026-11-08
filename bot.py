@@ -115,6 +115,7 @@ async def main() -> None:
             [
                 BotCommand(command="start", description="Что я умею"),
                 BotCommand(command="help", description="Помощь"),
+                BotCommand(command="services", description="Доступные сервисы"),
                 BotCommand(command="yt_debug", description="Диагностика YouTube"),
             ]
         )

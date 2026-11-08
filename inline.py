@@ -16,6 +16,7 @@ import html
 import logging
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -43,6 +44,7 @@ from config import DOWNLOADS_DIR, MAX_UPLOAD_MB
 from downloader import (
     AUDIO_EXTS,
     SEMAPHORE,
+    DownloadCancelled,
     DownloadError,
     Track,
     download_audio,
@@ -86,7 +88,34 @@ def _dl_kb(token: str) -> InlineKeyboardMarkup:
     )
 
 
+def _stop_kb(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏹ Остановить", callback_data=f"inlst:{token}")]
+        ]
+    )
+
+
 NO_KB = InlineKeyboardMarkup(inline_keyboard=[])
+
+# Активные inline-скачивания: token → событие отмены.
+_inline_jobs: dict[str, threading.Event] = {}
+
+
+async def _show_inline_stop(
+    bot: Bot, inline_message_id: str, token: str, delay: float = 0.0
+) -> None:
+    """Заменяет «⬇️ Скачать» на «⏹ Остановить», как только пошла загрузка."""
+    if delay:
+        await asyncio.sleep(delay)
+    if token not in _inline_jobs:
+        return
+    try:
+        await bot.edit_message_reply_markup(
+            inline_message_id=inline_message_id, reply_markup=_stop_kb(token)
+        )
+    except Exception:  # noqa: BLE001 — сообщение могли удалить
+        pass
 
 
 def _norm(text: str) -> str:
@@ -274,6 +303,7 @@ async def on_chosen(result: ChosenInlineResult, bot: Bot) -> None:
             payload["url"],
             payload.get("mode", "video"),
             result.from_user.id if result.from_user else None,
+            result.result_id,
         )
     elif payload["kind"] == "track":
         coro = _inline_track(
@@ -281,6 +311,7 @@ async def on_chosen(result: ChosenInlineResult, bot: Bot) -> None:
             result.inline_message_id,
             Track(**payload["track"]),
             result.from_user.id if result.from_user else None,
+            result.result_id,
         )
     else:
         return
@@ -324,6 +355,7 @@ async def on_download_button(callback: CallbackQuery, bot: Bot) -> None:
             payload["url"],
             payload.get("mode", "video"),
             callback.from_user.id,
+            token,
         )
     elif payload["kind"] == "track":
         coro = _inline_track(
@@ -331,6 +363,7 @@ async def on_download_button(callback: CallbackQuery, bot: Bot) -> None:
             callback.inline_message_id,
             Track(**payload["track"]),
             callback.from_user.id,
+            token,
         )
     else:
         return
@@ -338,23 +371,62 @@ async def on_download_button(callback: CallbackQuery, bot: Bot) -> None:
     _spawn(coro)
 
 
+@router.callback_query(F.data.startswith("inlst:"))
+async def on_inline_stop(callback: CallbackQuery, bot: Bot) -> None:
+    """⏹ Остановить в inline-сообщении."""
+    token = (callback.data or "")[6:]
+    event = _inline_jobs.get(token)
+    if event is None:
+        await callback.answer("Это скачивание уже завершилось.", show_alert=False)
+        return
+    event.set()
+    await callback.answer("Останавливаю…")
+    try:
+        if callback.inline_message_id:
+            await bot.edit_message_reply_markup(
+                inline_message_id=callback.inline_message_id, reply_markup=NO_KB
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _inline_media(
-    bot: Bot, inline_message_id: str, url: str, mode: str, user_id: int | None = None
+    bot: Bot,
+    inline_message_id: str,
+    url: str,
+    mode: str,
+    user_id: int | None = None,
+    token: str = "",
 ) -> None:
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(dir=DOWNLOADS_DIR))
+
+    cancel: threading.Event | None = None
+    stop_task: asyncio.Task | None = None
+    if token:
+        cancel = threading.Event()
+        _inline_jobs[token] = cancel
+        stop_task = asyncio.create_task(
+            _show_inline_stop(bot, inline_message_id, token)
+        )
 
     try:
         async with SEMAPHORE:
             if mode == "audio":
                 stub = Track("url", "", url, "", "", 0)
-                path, info = await asyncio.wait_for(download_audio(stub, tmp_dir), timeout=600)
+                path, info = await asyncio.wait_for(
+                    download_audio(stub, tmp_dir, cancel=cancel), timeout=600
+                )
             else:
-                path, info = await asyncio.wait_for(download_media(url, tmp_dir), timeout=600)
+                path, info = await asyncio.wait_for(
+                    download_media(url, tmp_dir, cancel=cancel), timeout=600
+                )
 
         _check_size(path)
         media = _build_inline_media(path, info, url, mode)
         await _edit_inline(bot, inline_message_id, media, path, info, url, mode, user_id)
+    except DownloadCancelled:
+        await _safe_edit_text(bot, inline_message_id, "⏹ Остановлено.")
     except DownloadError as exc:
         await _inline_error(bot, inline_message_id, str(exc))
     except asyncio.TimeoutError:
@@ -363,18 +435,37 @@ async def _inline_media(
         log.exception("inline media failed: %s", url)
         await _inline_error(bot, inline_message_id, "Не получилось скачать. Проверьте ссылку.")
     finally:
+        if stop_task is not None:
+            stop_task.cancel()
+        if token:
+            _inline_jobs.pop(token, None)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 async def _inline_track(
-    bot: Bot, inline_message_id: str, track: Track, user_id: int | None = None
+    bot: Bot,
+    inline_message_id: str,
+    track: Track,
+    user_id: int | None = None,
+    token: str = "",
 ) -> None:
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(dir=DOWNLOADS_DIR))
 
+    cancel: threading.Event | None = None
+    stop_task: asyncio.Task | None = None
+    if token:
+        cancel = threading.Event()
+        _inline_jobs[token] = cancel
+        stop_task = asyncio.create_task(
+            _show_inline_stop(bot, inline_message_id, token)
+        )
+
     try:
         async with SEMAPHORE:
-            path, info = await asyncio.wait_for(download_audio(track, tmp_dir), timeout=240)
+            path, info = await asyncio.wait_for(
+                download_audio(track, tmp_dir, cancel=cancel), timeout=240
+            )
 
         _check_size(path)
         title = (info.get("track") or track.title or path.stem)[:180]
@@ -389,6 +480,8 @@ async def _inline_track(
         await _edit_inline(
             bot, inline_message_id, media, path, info, track.url, "audio", user_id
         )
+    except DownloadCancelled:
+        await _safe_edit_text(bot, inline_message_id, "⏹ Остановлено.")
     except DownloadError as exc:
         await _inline_error(bot, inline_message_id, str(exc))
     except asyncio.TimeoutError:
@@ -397,6 +490,10 @@ async def _inline_track(
         log.exception("inline track failed: %s", track.url)
         await _inline_error(bot, inline_message_id, "Не получилось скачать трек.")
     finally:
+        if stop_task is not None:
+            stop_task.cancel()
+        if token:
+            _inline_jobs.pop(token, None)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 

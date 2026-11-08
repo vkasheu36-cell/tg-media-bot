@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -104,6 +105,10 @@ _ZV_SONG_ID_RE = re.compile(r"zvyki\.com/song/(\d+)")
 
 class DownloadError(Exception):
     """Ошибка, текст которой не стыдно показать пользователю."""
+
+
+class DownloadCancelled(Exception):
+    """Пользователь нажал «Остановить» — прерываем скачивание."""
 
 
 @dataclass(slots=True)
@@ -214,13 +219,19 @@ def _extract_info(url: str, opts: dict, download: bool = False):
         return ydl.sanitize_info(data) if data else {}
 
 
-def _extract_with_rescue(url: str, opts: dict, download: bool = False):
+def _extract_with_rescue(
+    url: str, opts: dict, download: bool = False, cancel=None
+):
     """extract_info; если YouTube не дал плеер — перебираем player_client."""
     global _yt_client
 
     try:
         return _dns_retry(lambda: _extract_info(url, opts, download=download))
     except Exception as exc:  # noqa: BLE001
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled() from exc
+        if isinstance(exc, DownloadCancelled):
+            raise
         if not is_youtube(url) or not _yt_should_retry(exc, download):
             raise
 
@@ -247,6 +258,8 @@ def _extract_with_rescue(url: str, opts: dict, download: bool = False):
 
         last = exc
         for client in ladder:
+            if cancel is not None and cancel.is_set():
+                raise DownloadCancelled()
             attempt = dict(opts)
             # при переборе не тратим минуты на повторы одного и того же клиента
             attempt["extractor_retries"] = 1
@@ -455,6 +468,314 @@ def _vk_download_direct(kind: str, media_url: str, out_dir: Path) -> tuple[Path,
     path = out_dir / f"vk{ext}"
     path.write_bytes(data)
     return path, {"id": "", "title": "", "duration": None}
+
+
+# ---------------------------------------------------------------- Reddit
+# Reddit закрыл анонимный JSON (403 Blocked) и требует вход для yt-dlp, но
+# публичный Atom-фид поста отдаёт и заголовок, и ссылки на медиа. Этого хватает:
+# картинки лежат на i.redd.it, родные видео — на v.redd.it (DASH без входа).
+
+_REDDIT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+    ),
+    "Accept": (
+        "application/atom+xml,application/xml;q=0.9,"
+        "text/html;q=0.8,*/*;q=0.7"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_REDDIT_COMMENTS_RE = re.compile(r"/comments/([A-Za-z0-9]+)", re.I)
+_REDDIT_GALLERY_RE = re.compile(r"/gallery/([A-Za-z0-9]+)", re.I)
+_REDDIT_VIDEO_RE = re.compile(r"https?://v\.redd\.it/([A-Za-z0-9]+)", re.I)
+_REDDIT_IMAGE_RE = re.compile(
+    r"https?://(?P<host>i\.redd\.it|preview\.redd\.it|i\.imgur\.com)/"
+    r"(?P<file>[^\s\"'<>?]+)",
+    re.I,
+)
+_REDDIT_YT_RE = re.compile(
+    r"https?://(?:www\.|m\.)?(?:youtube\.com/watch\?[^\s\"'<>]*v=|youtu\.be/)"
+    r"([A-Za-z0-9_-]{11})",
+    re.I,
+)
+_REDDIT_ATOM = {
+    "a": "http://www.w3.org/2005/Atom",
+    "media": "http://search.yahoo.com/mrss/",
+}
+
+
+def _is_reddit(url: str) -> bool:
+    host = (urlsplit(url).netloc or "").lower()
+    if host.startswith(("www.", "m.", "old.", "mobile.")):
+        host = host.split(".", 1)[1]
+    return host in {"reddit.com", "redd.it", "redditmedia.com", "redditstatic.com"}
+
+
+def _reddit_get(url: str, timeout: int = 20) -> tuple[str, bytes]:
+    """GET Reddit с запасным путём через WARP: у direct и туннеля разные лимиты."""
+    request = urllib.request.Request(url, headers=_REDDIT_HEADERS)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.geturl(), response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code not in {403, 429} or not _yt_proxy():
+            raise
+        log.info("Reddit: direct HTTP %s, пробую через прокси", exc.code)
+        status, body = _fetch_via_proxy(url, timeout=timeout)
+        if status == 200:
+            return url, body
+        raise
+    except Exception:
+        if not _yt_proxy():
+            raise
+        log.info("Reddit: direct не ответил, пробую через прокси")
+        status, body = _fetch_via_proxy(url, timeout=timeout)
+        if status == 200:
+            return url, body
+        raise
+
+
+def _reddit_canonical(url: str) -> str:
+    """Раскрывает redd.it и /s/<token> до полной ссылки на пост."""
+    parts = urlsplit(url)
+    host = (parts.netloc or "").lower()
+    path = parts.path or "/"
+
+    if host.endswith("redd.it") and not host.startswith("v."):
+        post_id = path.strip("/").split("/", 1)[0]
+        if post_id:
+            return f"https://www.reddit.com/comments/{post_id}"
+
+    if _REDDIT_COMMENTS_RE.search(path):
+        return urlunsplit(("https", "www.reddit.com", path, "", ""))
+
+    if "/s/" in path:
+        try:
+            final, _ = _reddit_get(url, timeout=15)
+        except urllib.error.HTTPError as exc:
+            raise DownloadError(
+                "Reddit: короткую ссылку /s/… не удалось раскрыть "
+                f"(HTTP {exc.code}). Пришлите полную ссылку из адресной строки."
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise DownloadError(
+                "Reddit: короткую ссылку /s/… не удалось раскрыть. "
+                "Пришлите полную ссылку на пост."
+            ) from exc
+        if _REDDIT_COMMENTS_RE.search(urlsplit(final).path):
+            return urlunsplit(("https", "www.reddit.com", urlsplit(final).path, "", ""))
+        raise DownloadError(
+            "Reddit: короткая ссылка /s/… уже не ведёт на пост (Reddit отправил "
+            "на главную сабреддита). Такие ссылки истекают — пришлите полную "
+            "ссылку из адресной строки вида reddit.com/r/…/comments/…"
+        )
+
+    match = _REDDIT_GALLERY_RE.search(path)
+    if match:
+        return f"https://www.reddit.com/comments/{match.group(1)}"
+
+    raise DownloadError(
+        "Reddit: не понял ссылку. Пришлите ссылку на пост "
+        "(reddit.com/r/…/comments/…) или на файл i.redd.it / v.redd.it."
+    )
+
+
+def _reddit_feed_url(canonical: str) -> str:
+    path = urlsplit(canonical).path.rstrip("/")
+    return f"https://www.reddit.com{path}/.rss?limit=1"
+
+
+def _reddit_feed_post(body: bytes) -> dict:
+    """Первый entry фида — сам пост; остальные — комментарии."""
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as exc:
+        raise DownloadError("Reddit: фид поста пришёл битым.") from exc
+    entries = root.findall("a:entry", _REDDIT_ATOM)
+    if not entries:
+        raise DownloadError("Reddit: пост не найден или удалён.")
+    entry = entries[0]
+    title_node = entry.find("a:title", _REDDIT_ATOM)
+    title = "".join(title_node.itertext()).strip() if title_node is not None else ""
+    link_node = entry.find("a:link", _REDDIT_ATOM)
+    link = link_node.get("href") if link_node is not None else ""
+    content_node = entry.find("a:content", _REDDIT_ATOM)
+    content = (
+        "".join(content_node.itertext()) if content_node is not None else ""
+    )
+    return {
+        "title": html.unescape(title) or "Reddit",
+        "link": link,
+        "content": html.unescape(content),
+    }
+
+
+def _reddit_media(content: str) -> tuple[str, str] | None:
+    """Возвращает («video»|«image»|«url», ссылка) для первого вложения поста."""
+    video = _REDDIT_VIDEO_RE.search(content)
+    if video:
+        # DASH-манифест открыт без входа, в отличие от страницы поста.
+        return "video", f"https://v.redd.it/{video.group(1)}/DASHPlaylist.mpd"
+
+    youtube = _REDDIT_YT_RE.search(content)
+    if youtube:
+        return "url", f"https://youtu.be/{youtube.group(1)}"
+
+    images = list(_REDDIT_IMAGE_RE.finditer(content))
+    if images:
+        # i.redd.it — полный файл; preview.* — тот же файл в уменьшенном виде.
+        for match in images:
+            host = match.group("host").lower()
+            if host == "i.redd.it":
+                return "image", f"https://i.redd.it/{match.group('file')}"
+        for match in images:
+            host = match.group("host").lower()
+            if host == "preview.redd.it":
+                return "image", f"https://i.redd.it/{match.group('file')}"
+            if host == "i.imgur.com":
+                return "image", f"https://i.imgur.com/{match.group('file')}"
+
+    # Внешняя ссылка: берём её же, если это не служебный reddit-домен.
+    for candidate in re.findall(r"https?://[^\s\"'<>]+", content):
+        host = (urlsplit(candidate).netloc or "").lower()
+        if host and not host.endswith(("reddit.com", "redd.it")):
+            if any(
+                token in host for token in ("imgur.com", "giphy.com", "redgifs.com")
+            ):
+                return "url", candidate
+    return None
+
+
+def _reddit_author(content: str) -> str:
+    match = re.search(r"reddit\.com/user/([^\"'/<>\s]+)", content)
+    return f"u/{match.group(1)}" if match else ""
+
+
+def _reddit_download_sync(
+    url: str,
+    out_dir: Path,
+    mode: str = "auto",
+    on_progress=None,
+    cancel: threading.Event | None = None,
+) -> tuple[Path, dict]:
+    """Reddit без входа: фид поста → картинка или DASH-манифест видео."""
+    if cancel is not None and cancel.is_set():
+        raise DownloadCancelled()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    canonical = _reddit_canonical(url)
+
+    try:
+        _, body = _reddit_get(_reddit_feed_url(canonical), timeout=25)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise DownloadError(
+                "Reddit: временно ограничил запросы (HTTP 429). "
+                "Подождите минуту и пришлите ссылку ещё раз."
+            ) from exc
+        if exc.code in {403, 401}:
+            raise DownloadError(
+                "Reddit: заблокировал серверный IP. Нужны cookies аккаунта "
+                "(REDDIT_COOKIE) или свой прокси."
+            ) from exc
+        raise DownloadError(f"Reddit: фид поста ответил HTTP {exc.code}.") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise DownloadError(f"Reddit: не удалось открыть пост ({str(exc)[:120]}).") from exc
+
+    post = _reddit_feed_post(body)
+    media = _reddit_media(post["content"])
+    if not media:
+        raise DownloadError(
+            "Reddit: в посте нет видео или картинки — бывает у текстовых постов. "
+            "Пришлите ссылку на пост с вложением."
+        )
+    kind, media_url = media
+    if kind == "image" and mode == "audio":
+        raise DownloadError(
+            "Reddit: в посте картинка, звуковой дорожки нет. "
+            "Выберите «Фото-видео» — пришлю изображение."
+        )
+    info = {
+        "title": post["title"],
+        "uploader": _reddit_author(post["content"]),
+        "duration": 0,
+        "webpage_url": canonical,
+    }
+
+    if kind == "image":
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled()
+        try:
+            data = _http_get(media_url, timeout=90)
+        except urllib.error.HTTPError as exc:
+            raise DownloadError(f"Reddit: картинка не скачалась (HTTP {exc.code}).") from exc
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled()
+        ext = _guess_ext(media_url)
+        if ext not in {".jpg", ".png", ".webp", ".gif"}:
+            ext = ".jpg"
+        path = out_dir / f"reddit{ext}"
+        path.write_bytes(data)
+        log.info("Reddit: картинка %s (%s байт)", media_url, len(data))
+        return path, info
+
+    if kind == "url":
+        # YouTube/Imgur/RedGifs отдаём обычному пути yt-dlp ниже.
+        raise _RedditExternal(media_url)
+
+    if cancel is not None and cancel.is_set():
+        raise DownloadCancelled()
+
+    opts: dict = _opts() | {
+        "noplaylist": True,
+        "outtmpl": str(out_dir / "%(title).60s [%(id)s].%(ext)s"),
+        "progress_hooks": _progress_hook(on_progress, None, cancel),
+    }
+    if mode == "audio":
+        opts |= {
+            "format": "bestaudio/best",
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        }
+    else:
+        opts |= {
+            "format": "bestvideo*+bestaudio/best",
+            "merge_output_format": "mp4",
+        }
+
+    try:
+        _extract_with_rescue(media_url, opts, download=True, cancel=cancel)
+    except DownloadCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise DownloadError(f"Reddit: видео не скачалось ({str(exc)[:120]}).") from exc
+
+    files = [
+        p
+        for p in out_dir.iterdir()
+        if p.is_file() and not p.name.endswith((".part", ".ytdl"))
+    ]
+    if not files:
+        raise DownloadError("Reddit: видео скачалось, но файл не найден.")
+    path = max(files, key=lambda p: p.stat().st_size)
+    info["duration"] = int(info.get("duration") or 0)
+    log.info("Reddit: видео %s → %s", media_url, path.name)
+    return path, info
+
+
+class _RedditExternal(Exception):
+    """В посте внешняя ссылка (YouTube и т.п.) — её обработает yt-dlp."""
+
+    def __init__(self, url: str):
+        super().__init__(url)
+        self.url = url
+
 
 
 def _dns_retry(func, attempts: int = 3, delay: float = 1.5):
@@ -862,7 +1183,7 @@ async def resolve_music_link(url: str) -> str | None:
 
 
 def _search_sync(query: str, provider: str, limit: int) -> list[Track]:
-    prefix = "scsearch"
+    prefix = "ytsearch" if provider == "yt" else "scsearch"
     opts = _opts() | {"extract_flat": "in_playlist", "skip_download": True}
 
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -888,6 +1209,9 @@ def _search_sync(query: str, provider: str, limit: int) -> list[Track]:
         url = (entry.get("webpage_url") or entry.get("url") or "").strip()
         video_id = str(entry.get("id") or url)
 
+        if url and not url.startswith("http"):
+            # плоский поиск YouTube отдаёт id — собираем короткую ссылку
+            url = f"https://youtu.be/{video_id}"
         if not url.startswith("http"):
             continue
 
@@ -941,6 +1265,7 @@ def _hitmo_get(
     attempts: int = 3,
     timeout: float = 30.0,
     on_progress=None,
+    cancel=None,
 ) -> bytes:
     """Запрос к Hitmo с браузерными заголовками и повторами.
 
@@ -949,22 +1274,27 @@ def _hitmo_get(
     """
     last: Exception | None = None
     for attempt in range(attempts):
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled()
         request = urllib.request.Request(url, headers={**HITMO_HEADERS, "Referer": referer})
         try:
             with opener.open(request, timeout=timeout) as response:
-                if on_progress is None:
+                if on_progress is None and cancel is None:
                     return response.read()
                 total = response.headers.get("Content-Length")
                 total = int(total) if total and total.isdigit() else None
                 chunks: list[bytes] = []
                 done = 0
                 while True:
+                    if cancel is not None and cancel.is_set():
+                        raise DownloadCancelled()
                     chunk = response.read(65536)
                     if not chunk:
                         break
                     chunks.append(chunk)
                     done += len(chunk)
-                    on_progress(done, total)
+                    if on_progress:
+                        on_progress(done, total)
                 return b"".join(chunks)
         except urllib.error.HTTPError as exc:
             last = exc
@@ -1066,16 +1396,28 @@ def _safe_track_name(text: str) -> str:
 
 
 def _hitmo_download_sync(
-    track: Track, out_dir: Path, on_progress=None
+    track: Track, out_dir: Path, on_progress=None, cancel=None
 ) -> tuple[Path, dict]:
     """Hitmo отдаёт готовый mp3, поэтому качаем напрямую, без yt-dlp."""
+    if cancel is not None and cancel.is_set():
+        raise DownloadCancelled()
     opener = _hitmo_opener()
     try:
-        _hitmo_get(HITMO_BASE + "/", opener, attempts=2)  # cookie сессии
+        _hitmo_get(HITMO_BASE + "/", opener, attempts=2, cancel=cancel)  # cookie сессии
+    except DownloadCancelled:
+        raise
     except Exception as exc:  # noqa: BLE001 — без cookie тоже может сработать
         log.debug("Hitmo: не удалось открыть главную: %s", exc)
 
-    data = _hitmo_get(track.url, opener, referer=HITMO_BASE + "/", on_progress=on_progress)
+    data = _hitmo_get(
+        track.url,
+        opener,
+        referer=HITMO_BASE + "/",
+        on_progress=on_progress,
+        cancel=cancel,
+    )
+    if cancel is not None and cancel.is_set():
+        raise DownloadCancelled()
     if len(data) < 50_000:
         raise DownloadError("Hitmo отдал пустой файл. Попробуйте другой трек.")
     if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
@@ -1093,7 +1435,9 @@ def _hitmo_download_sync(
     }
 
 
-def _hitmo_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, dict]:
+def _hitmo_from_url_sync(
+    url: str, out_dir: Path, on_progress=None, cancel=None
+) -> tuple[Path, dict]:
     """Ссылка на Hitmo из чата: страница трека или прямой mp3."""
     if _HITMO_MP3_RE.search(urlsplit(url).path):
         stem = urllib.parse.unquote(urlsplit(url).path.rsplit("/", 1)[-1])
@@ -1103,7 +1447,7 @@ def _hitmo_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Pat
         track = Track(provider="hm", video_id=url, url=url, title=title, uploader="", duration=0)
     else:
         track = _hitmo_song_track_sync(url)
-    return _hitmo_download_sync(track, out_dir, on_progress)
+    return _hitmo_download_sync(track, out_dir, on_progress, cancel)
 
 
 # ---------------------------------------------------------------- Zvyki
@@ -1195,7 +1539,7 @@ def _zvyki_song_track_sync(url: str) -> Track:
     raise DownloadError("Zvyki: не удалось разобрать страницу трека.")
 
 
-def _zvyki_fetch_file(url: str, dest: Path, on_progress=None) -> int:
+def _zvyki_fetch_file(url: str, dest: Path, on_progress=None, cancel=None) -> int:
     safe = urllib.parse.quote(url, safe=":/?&=%(),._-~+")
     request = urllib.request.Request(
         safe, headers={**ZVYKI_HEADERS, "Referer": ZVYKI_BASE + "/"}
@@ -1204,15 +1548,21 @@ def _zvyki_fetch_file(url: str, dest: Path, on_progress=None) -> int:
         total = response.headers.get("Content-Length")
         total = int(total) if total and total.isdigit() else None
         done = 0
-        with dest.open("wb") as fh:
-            while True:
-                chunk = response.read(65536)
-                if not chunk:
-                    break
-                fh.write(chunk)
-                done += len(chunk)
-                if on_progress:
-                    on_progress(done, total)
+        try:
+            with dest.open("wb") as fh:
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        raise DownloadCancelled()
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    done += len(chunk)
+                    if on_progress:
+                        on_progress(done, total)
+        except BaseException:
+            dest.unlink(missing_ok=True)
+            raise
     return done
 
 
@@ -1253,8 +1603,10 @@ def _sniff_audio(head: bytes) -> str:
 
 
 def _zvyki_download_sync(
-    track: Track, out_dir: Path, on_progress=None
+    track: Track, out_dir: Path, on_progress=None, cancel=None
 ) -> tuple[Path, dict]:
+    if cancel is not None and cancel.is_set():
+        raise DownloadCancelled()
     out_dir.mkdir(parents=True, exist_ok=True)
     if track.uploader:
         name = _safe_track_name(f"{track.uploader} - {track.title}")
@@ -1263,7 +1615,10 @@ def _zvyki_download_sync(
 
     # Zvyki отдаёт то mp3, то голый AAC — определяем по первым байтам
     raw = out_dir / f"{name}.tmp"
-    size = _zvyki_fetch_file(track.url, raw, on_progress)
+    size = _zvyki_fetch_file(track.url, raw, on_progress, cancel)
+    if cancel is not None and cancel.is_set():
+        raw.unlink(missing_ok=True)
+        raise DownloadCancelled()
     if size < 20_000:
         raw.unlink(missing_ok=True)
         raise DownloadError("Zvyki отдал пустой файл. Попробуйте другой трек.")
@@ -1296,7 +1651,9 @@ def _zvyki_download_sync(
     }
 
 
-def _zvyki_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, dict]:
+def _zvyki_from_url_sync(
+    url: str, out_dir: Path, on_progress=None, cancel=None
+) -> tuple[Path, dict]:
     """Ссылка на Zvyki из чата: страница трека или прямой файл data.zvyki.com."""
     if (urlsplit(url).netloc or "").lower().startswith("data."):
         stem = urllib.parse.unquote(urlsplit(url).path.rsplit("/", 1)[-1])
@@ -1315,7 +1672,7 @@ def _zvyki_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Pat
         )
     else:
         track = _zvyki_song_track_sync(url)
-    return _zvyki_download_sync(track, out_dir, on_progress)
+    return _zvyki_download_sync(track, out_dir, on_progress, cancel)
 
 
 def is_youtube(url: str) -> bool:
@@ -1408,6 +1765,7 @@ _COBALT_HOSTS = {
     "vimeo": ("vimeo.com",),
     "twitch": ("twitch.tv",),
     "dailymotion": ("dailymotion.com", "dai.ly"),
+    "vk": ("vk.com", "vk.ru", "vkvideo.ru", "vk.cc", "vk.link"),
     "ok": ("ok.ru",),
     "pinterest": ("pinterest.com", "pin.it"),
     "tumblr": ("tumblr.com",),
@@ -1418,6 +1776,12 @@ _COBALT_HOSTS = {
     "bluesky": ("bsky.app",),
     "loom": ("loom.com",),
 }
+
+
+_COBALT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+)
 
 
 def _cobalt_instances() -> list[tuple[str, str]]:
@@ -1474,6 +1838,122 @@ def _use_cobalt(url: str) -> bool:
     return _cobalt_service(url) is not None
 
 
+# Подписи для кнопки «Сервисы»: ключи совпадают с _COBALT_HOSTS / cobalt.
+_COBALT_LABELS = {
+    "bilibili": "Bilibili",
+    "bluesky": "Bluesky",
+    "dailymotion": "Dailymotion",
+    "facebook": "Facebook",
+    "instagram": "Instagram",
+    "loom": "Loom",
+    "newgrounds": "Newgrounds",
+    "ok": "OK.ru",
+    "pinterest": "Pinterest",
+    "reddit": "Reddit",
+    "rutube": "Rutube",
+    "snapchat": "Snapchat",
+    "soundcloud": "SoundCloud",
+    "streamable": "Streamable",
+    "tiktok": "TikTok",
+    "tumblr": "Tumblr",
+    "twitch": "Twitch (клипы)",
+    "twitter": "X (Twitter)",
+    "vimeo": "Vimeo",
+    "vk": "VK",
+    "youtube": "YouTube",
+}
+
+# cobalt в списке сервисов пишет «twitch clips», а в запросах — «twitch».
+_COBALT_ALIASES = {"twitch clips": "twitch", "twitchclips": "twitch"}
+_COBALT_FALLBACK_SERVICES = [name for name in _COBALT_HOSTS if name != "youtube"]
+
+
+def _cobalt_key(name: str) -> str:
+    lowered = " ".join(name.lower().split())
+    return _COBALT_ALIASES.get(lowered, lowered)
+
+
+def _cobalt_live_services() -> tuple[list[str], str, str]:
+    """Спрашивает у инстанса GET /: какие сервисы он реально умеет.
+
+    Возвращает (сервисы, версия, адрес инстанса). Если ни один инстанс не
+    ответил, отдаёт встроенный список — кнопка должна работать всегда.
+    """
+    for base, _auth in _cobalt_instances():
+        try:
+            request = urllib.request.Request(
+                f"{base}/",
+                headers={"Accept": "application/json", "User-Agent": _COBALT_UA},
+            )
+            with _cobalt_open(request, timeout=8) as response:
+                data = json.loads(response.read().decode("utf-8", "replace"))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("cobalt: список сервисов не получен с %s: %s", base, exc)
+            continue
+        cobalt = data.get("cobalt") if isinstance(data, dict) else None
+        if not isinstance(cobalt, dict):
+            continue
+        raw = cobalt.get("services")
+        if not isinstance(raw, list):
+            continue
+        services = []
+        for item in raw:
+            key = _cobalt_key(str(item))
+            if key and key not in services:
+                services.append(key)
+        if services:
+            return services, str(cobalt.get("version") or ""), base
+
+    return list(_COBALT_FALLBACK_SERVICES), "", ""
+
+
+def cobalt_services_report() -> str:
+    """Текст для кнопки «Сервисы»: что умеет cobalt и что включено в боте."""
+    enabled = _cobalt_services()
+    services, version, base = _cobalt_live_services()
+
+    lines = ["🎛 <b>Сервисы cobalt</b>"]
+    if version:
+        lines.append(f"<i>инстанс v{html.escape(version)}</i>")
+    lines.append("")
+
+    if enabled:
+        pretty = ", ".join(_COBALT_LABELS.get(name, name.title()) for name in sorted(enabled))
+        lines.append(f"⚡ Через cobalt: <b>{pretty}</b>")
+    else:
+        lines.append("⚡ Через cobalt сейчас ничего не включено.")
+    if COBALT_YOUTUBE:
+        lines.append("▶️ YouTube тоже отдаётся в cobalt (COBALT_YOUTUBE=1).")
+    else:
+        lines.append("▶️ YouTube качается напрямую: yt-dlp + cookies.")
+    lines.append("")
+
+    lines.append(f"Доступно у инстанса: <b>{len(services)}</b>")
+    if not base:
+        lines.append(
+            "<i>COBALT_API не задан — показан встроенный список сервисов.</i>"
+        )
+    for name in services:
+        mark = "✅" if name in enabled else "▫️"
+        label = _COBALT_LABELS.get(name, name.title())
+        lines.append(f"{mark} {html.escape(label)}")
+    lines.append("")
+
+    unknown = sorted(enabled - set(services) - {"youtube"})
+    if unknown:
+        lines.append(
+            "⚠️ Включено в COBALT_SERVICES, но инстанс не умеет: "
+            + ", ".join(html.escape(name) for name in unknown)
+        )
+        lines.append("")
+
+    lines.append(
+        "<i>✅ — бот отдаёт ссылку в cobalt, ▫️ — качает своим путём "
+        "(yt-dlp или собственный разбор).</i>"
+    )
+    return "\n".join(lines)
+
+
 def _cobalt_open(request: urllib.request.Request, timeout: int):
     if COBALT_PROXY:
         opener = urllib.request.build_opener(
@@ -1484,7 +1964,11 @@ def _cobalt_open(request: urllib.request.Request, timeout: int):
 
 
 def _cobalt_post(base: str, auth: str, payload: dict, timeout: int = 120) -> dict:
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": _COBALT_UA,
+    }
     if auth:
         headers["Authorization"] = _cobalt_auth(auth)
     request = urllib.request.Request(
@@ -1596,8 +2080,9 @@ def _cobalt_fetch(
     auth: str,
     budget: int,
     on_progress=None,
+    cancel=None,
 ) -> Path:
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+    headers = {"User-Agent": _COBALT_UA, "Accept": "*/*"}
     if auth:
         headers["Authorization"] = _cobalt_auth(auth)
     request = urllib.request.Request(file_url, headers=headers)
@@ -1616,6 +2101,8 @@ def _cobalt_fetch(
         try:
             with dest.open("wb") as handle:
                 while True:
+                    if cancel is not None and cancel.is_set():
+                        raise DownloadCancelled()
                     chunk = response.read(256 * 1024)
                     if not chunk:
                         break
@@ -1625,7 +2112,7 @@ def _cobalt_fetch(
                     handle.write(chunk)
                     if on_progress:
                         on_progress(done, total or None)
-        except _CobaltTooBig:
+        except (_CobaltTooBig, DownloadCancelled):
             dest.unlink(missing_ok=True)
             raise
         except Exception:
@@ -1708,7 +2195,7 @@ def _clear_dir(out_dir: Path) -> None:
 
 
 def _cobalt_download_sync(
-    url: str, out_dir: Path, mode: str = "auto", on_progress=None
+    url: str, out_dir: Path, mode: str = "auto", on_progress=None, cancel=None
 ) -> tuple[Path, dict]:
     instances = _cobalt_instances()
     if not instances:
@@ -1721,8 +2208,12 @@ def _cobalt_download_sync(
 
     for base, auth in instances:
         for quality in _cobalt_ladder(mode):
+            if cancel is not None and cancel.is_set():
+                raise DownloadCancelled()
             try:
                 response = _cobalt_post(base, auth, _cobalt_payload(url, mode, quality))
+                if cancel is not None and cancel.is_set():
+                    raise DownloadCancelled()
                 file_url, filename = _cobalt_pick(response)
                 path = _cobalt_fetch(
                     file_url,
@@ -1731,10 +2222,14 @@ def _cobalt_download_sync(
                     auth,
                     budget,
                     on_progress,
+                    cancel,
                 )
                 info = _cobalt_info(path, url, response)
                 log.info("cobalt: %s → %s (%s, %s)", base, path.name, mode, quality)
                 return path, info
+            except DownloadCancelled:
+                _clear_dir(out_dir)
+                raise
             except _CobaltTooBig:
                 last = _CobaltTooBig()
                 log.info("cobalt: %s не влез в лимит на качестве %s", base, quality)
@@ -1845,7 +2340,7 @@ def _rank_tracks(query: str, tracks: list[Track]) -> list[Track]:
 
 
 async def search(query: str, limit: int = 12, budget: float | None = None) -> list[Track]:
-    """Ищет треки: Hitmo и Zvyki (готовые файлы), затем SoundCloud.
+    """Ищет треки: Hitmo и Zvyki (готовые файлы), затем SoundCloud и YouTube.
 
     ``budget`` — сколько секунд ждать (для inline-режима). Если Hitmo уже дал
     достаточно результатов, медленные источники не трогаем вовсе.
@@ -1865,19 +2360,20 @@ async def search(query: str, limit: int = 12, budget: float | None = None) -> li
     except Exception:  # noqa: BLE001 — таймаут или сбой Hitmo
         tracks = []
 
-    # Hitmo редко отдаёт больше десятка треков — добираем Zvyki и SoundCloud,
-    # иначе список обрывается на нескольких результатах и страниц почти нет.
+    # Hitmo редко отдаёт больше десятка треков — добираем Zvyki, SoundCloud
+    # и YouTube, иначе список обрывается на нескольких результатах.
     if len(tracks) < limit:
         needed = max(4, limit - len(tracks))
         tasks = [
             asyncio.create_task(_search_one(query_for_search, provider, needed))
-            for provider in ("zv", "sc")
+            for provider in ("zv", "sc", "yt")
         ]
         if deadline is not None:
             wait_for_extra = max(0.0, deadline - time.monotonic())
         elif tracks:
-            # Hitmo уже что-то нашёл — не заставляем человека ждать медленные источники
-            wait_for_extra = 3.0
+            # Hitmo уже что-то нашёл — даём остальным (особенно YouTube)
+            # несколько секунд, но не заставляем человека ждать слишком долго
+            wait_for_extra = 8.0
         else:
             wait_for_extra = 20.0
 
@@ -1909,12 +2405,14 @@ class _TooBig(Exception):
     """Файл превысил лимит Telegram во время скачивания."""
 
 
-def _progress_hook(on_progress, limit: int | None = None):
+def _progress_hook(on_progress, limit: int | None = None, cancel=None):
     """Мост между потоком yt-dlp и прогресс-баром в сообщении."""
-    if on_progress is None and limit is None:
+    if on_progress is None and limit is None and cancel is None:
         return []
 
     def hook(data: dict) -> None:
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled()
         status = data.get("status")
         if status == "downloading":
             done = int(data.get("downloaded_bytes") or 0)
@@ -1935,9 +2433,11 @@ def _progress_hook(on_progress, limit: int | None = None):
 
 
 def _download_audio_sync(
-    track: Track, out_dir: Path, on_progress=None
+    track: Track, out_dir: Path, on_progress=None, cancel=None
 ) -> tuple[Path, dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    if cancel is not None and cancel.is_set():
+        raise DownloadCancelled()
 
     cobalt_error: str | None = None
     target = _public_url(track.url)
@@ -1952,23 +2452,46 @@ def _download_audio_sync(
             uploader=track.uploader,
             duration=track.duration,
         )
+
+    # Reddit: звук из родного видео берём из DASH, без входа в аккаунт.
+    if _is_reddit(track.url):
+        try:
+            return _reddit_download_sync(track.url, out_dir, "audio", on_progress, cancel)
+        except _RedditExternal as external:
+            track = Track(
+                provider="",
+                video_id="",
+                url=external.url,
+                title=track.title,
+                uploader=track.uploader,
+                duration=track.duration,
+            )
+        except DownloadCancelled:
+            raise
+        except DownloadError as exc:
+            log.warning("Reddit (аудио) не осилил %s: %s", track.url, exc)
+
     if _cobalt_instances() and _use_cobalt(track.url):
         try:
-            return _cobalt_download_sync(track.url, out_dir, "audio", on_progress)
+            return _cobalt_download_sync(
+                track.url, out_dir, "audio", on_progress, cancel
+            )
+        except DownloadCancelled:
+            raise
         except DownloadError as exc:
             cobalt_error = str(exc)
             log.warning("cobalt (аудио) не осилил %s: %s", track.url, exc)
             _clear_dir(out_dir)
 
     if track.provider == "hm":
-        return _hitmo_download_sync(track, out_dir, on_progress)
+        return _hitmo_download_sync(track, out_dir, on_progress, cancel)
     if track.provider == "zv":
-        return _zvyki_download_sync(track, out_dir, on_progress)
+        return _zvyki_download_sync(track, out_dir, on_progress, cancel)
     if _is_hitmo(track.url):
         # ссылка на страницу трека из Hitmo: разбираем её и качаем mp3
-        return _hitmo_from_url_sync(track.url, out_dir, on_progress)
+        return _hitmo_from_url_sync(track.url, out_dir, on_progress, cancel)
     if _is_zvyki(track.url):
-        return _zvyki_from_url_sync(track.url, out_dir, on_progress)
+        return _zvyki_from_url_sync(track.url, out_dir, on_progress, cancel)
 
     url = _vk_url(track.url) if _is_vk(track.url) else track.url
 
@@ -1976,7 +2499,7 @@ def _download_audio_sync(
         "format": "bestaudio/best",
         "outtmpl": str(out_dir / "%(title).80s.%(ext)s"),
         "writethumbnail": True,
-        "progress_hooks": _progress_hook(on_progress),
+        "progress_hooks": _progress_hook(on_progress, None, cancel),
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -1989,7 +2512,11 @@ def _download_audio_sync(
     }
 
     try:
-        info = _extract_with_rescue(_public_url(url), opts, download=True)
+        info = _extract_with_rescue(
+            _public_url(url), opts, download=True, cancel=cancel
+        )
+    except DownloadCancelled:
+        raise
     except Exception as exc:
         if cobalt_error and _yt_bot_check(exc):
             raise DownloadError(cobalt_error) from exc
@@ -2008,11 +2535,13 @@ def _download_audio_sync(
 
 
 async def download_audio(
-    track: Track, out_dir: Path, on_progress=None
+    track: Track, out_dir: Path, on_progress=None, cancel=None
 ) -> tuple[Path, dict]:
     try:
-        return await asyncio.to_thread(_download_audio_sync, track, out_dir, on_progress)
-    except DownloadError:
+        return await asyncio.to_thread(
+            _download_audio_sync, track, out_dir, on_progress, cancel
+        )
+    except (DownloadError, DownloadCancelled):
         raise
     except Exception as exc:  # noqa: BLE001
         log.exception("audio download failed: %s", track.url)
@@ -3188,30 +3717,36 @@ def _yt_page_probe(video_id: str) -> str:
 
 
 def _yt_diagnose_sync(url: str) -> str:
-    """Проверяет, какой player_client YouTube пускает с IP Render."""
+    """Проверяет, какой player_client YouTube пускает с IP Render.
+
+    Быстрый путь: пробуем рабочий клиент из памяти и список YT_PLAYER_CLIENT,
+    останавливаемся на первом успехе — дорогие проверки (вход по cookies,
+    внешний IP, страницы YouTube) нужны только если не ответил никто.
+    """
     match = _YT_ID_RE.search(url)
     video_id = match.group(1) if match else ""
-    proxy_egress = _proxy_egress_report()
+    js_report = js_runtime_report()
     lines = [
         f"yt-dlp: {yt_dlp.version.__version__}",
         _cookie_report(),
-        cookie_login_state(),
-        js_runtime_report(),
+        js_report,
         f"YT_PLAYER_CLIENT: {YT_PLAYER_CLIENT or '—'}",
         f"POT_SERVER: {'есть' if POT_SERVER else 'нет'}",
         f"PROXY: {'есть' if PROXY else 'нет'}",
         f"YT_PROXY: {'есть' if YT_PROXY else 'нет'}",
         f"рабочий клиент в памяти: {_yt_client or '—'}",
-        _egress_report(),
-        *([proxy_egress] if proxy_egress else []),
-        _yt_page_probe(video_id),
         "",
     ]
-    clients = list(_YT_CLIENT_LADDER)
+    clients: list[str] = []
+    if _yt_client:
+        clients.append(_yt_client)
     for chunk in (YT_PLAYER_CLIENT or "").split(","):
         chunk = chunk.strip()
         if chunk and chunk not in clients:
-            clients.insert(0, chunk)
+            clients.append(chunk)
+    for client in _YT_CLIENT_LADDER:
+        if client not in clients:
+            clients.append(client)
     ok_clients: list[str] = []
     seen_notes: set[str] = set()
 
@@ -3219,8 +3754,8 @@ def _yt_diagnose_sync(url: str) -> str:
         logger = _YtDiagLogger()
         opts = _yt_client_opts(client) | {
             "skip_download": True,
-            "socket_timeout": 12,
-            "extractor_retries": 1,
+            "socket_timeout": 8,
+            "extractor_retries": 0,
             "retries": 1,
             "verbose": True,
             "logger": logger,
@@ -3255,18 +3790,29 @@ def _yt_diagnose_sync(url: str) -> str:
         return True
 
     for client in clients:
-        try_client(client)
+        if try_client(client):
+            break
 
     if not ok_clients:
         lines.append("")
+        lines.append("углублённая проверка (ни один клиент не ответил):")
+        lines.append(cookie_login_state())
+        lines.append(_egress_report())
+        proxy_egress = _proxy_egress_report()
+        if proxy_egress:
+            lines.append(proxy_egress)
+        lines.append(_yt_page_probe(video_id))
+
+        lines.append("")
         lines.append("повтор только по IPv4:")
         for client in ("web_embedded", "tv_samsung"):
-            try_client(client, {"force_ipv4": True}, " (IPv4)")
+            if try_client(client, {"force_ipv4": True}, " (IPv4)"):
+                break
 
-    if not ok_clients and COOKIES_FILE:
-        lines.append("")
-        lines.append("без cookies:")
-        try_client("web_embedded", {"cookiefile": None}, " (без cookies)")
+        if not ok_clients and COOKIES_FILE:
+            lines.append("")
+            lines.append("без cookies:")
+            try_client("web_embedded", {"cookiefile": None}, " (без cookies)")
 
     lines.append("")
     lines.append("после проверки — " + _cookie_report())
@@ -3279,7 +3825,7 @@ def _yt_diagnose_sync(url: str) -> str:
             "sign in to confirm" in line.lower() or "not a bot" in line.lower()
             for line in lines
         )
-        if "НЕТ" in js_runtime_report():
+        if "НЕТ" in js_report:
             lines.append(
                 "На сервере нет JS-движка — с cookies YouTube почти всегда "
                 "отказывает. В образе должен быть Deno (см. Dockerfile)."
@@ -3321,11 +3867,27 @@ async def yt_diagnose(url: str) -> str:
 
 
 def _download_media_sync(
-    url: str, out_dir: Path, on_progress=None
+    url: str, out_dir: Path, on_progress=None, cancel=None
 ) -> tuple[Path, dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    if cancel is not None and cancel.is_set():
+        raise DownloadCancelled()
 
     url = _public_url(url)
+
+    # Reddit: свой путь через публичный Atom-фид (JSON и yt-dlp требуют вход).
+    reddit_error: DownloadError | None = None
+    if _is_reddit(url):
+        try:
+            return _reddit_download_sync(url, out_dir, "auto", on_progress, cancel)
+        except _RedditExternal as external:
+            url = external.url
+            log.info("Reddit: в посте внешняя ссылка, отдаю yt-dlp: %s", url)
+        except DownloadCancelled:
+            raise
+        except DownloadError as exc:
+            reddit_error = exc
+            log.warning("Reddit не осилил %s: %s", url, exc)
 
     # cobalt: сервисы из COBALT_SERVICES (YouTube — только при COBALT_YOUTUBE=1).
     # Если он не справился — работает обычный путь yt-dlp. При обоюдной ошибке
@@ -3333,7 +3895,9 @@ def _download_media_sync(
     cobalt_error: str | None = None
     if _use_cobalt(url):
         try:
-            return _cobalt_download_sync(url, out_dir, "auto", on_progress)
+            return _cobalt_download_sync(url, out_dir, "auto", on_progress, cancel)
+        except DownloadCancelled:
+            raise
         except DownloadError as exc:
             cobalt_error = str(exc)
             log.warning("cobalt не осилил %s: %s", url, exc)
@@ -3345,11 +3909,11 @@ def _download_media_sync(
 
     # Hitmo: yt-dlp не умеет его страницы треков, качаем своим путём
     if _is_hitmo(url):
-        return _hitmo_from_url_sync(url, out_dir, on_progress)
+        return _hitmo_from_url_sync(url, out_dir, on_progress, cancel)
 
     # Zvyki: тоже свой разбор, отдаёт AAC
     if _is_zvyki(url):
-        return _zvyki_from_url_sync(url, out_dir, on_progress)
+        return _zvyki_from_url_sync(url, out_dir, on_progress, cancel)
 
     # FurAffinity: yt-dlp его не знает, а страницы закрыты Cloudflare
     if _is_fa(url):
@@ -3357,11 +3921,21 @@ def _download_media_sync(
 
     # 1) лёгкий проход без скачивания: узнаём форматы, размеры, метаданные
     def _probe():
-        return _extract_with_rescue(url, _opts() | {"skip_download": True})
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled()
+        return _extract_with_rescue(
+            url, _opts() | {"skip_download": True}, cancel=cancel
+        )
 
     try:
         info = _probe()
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled()
+    except DownloadCancelled:
+        raise
     except Exception as exc:
+        if reddit_error is not None:
+            raise reddit_error from exc
         if cobalt_error and _yt_bot_check(exc):
             raise DownloadError(cobalt_error) from exc
 
@@ -3388,6 +3962,8 @@ def _download_media_sync(
         fallback = _x_media_sync(url, out_dir)
         if fallback:
             return fallback
+        if reddit_error is not None:
+            raise reddit_error
         raise DownloadError("Не удалось разобрать ссылку — возможно, сервис не поддерживается.")
 
     if info.get("_type") == "playlist":
@@ -3444,6 +4020,8 @@ def _download_media_sync(
 
     # 2) пробуем форматы по очереди, пока файл не влезет в лимит Telegram
     for fmt in _format_candidates(info, budget):
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled()
         # подчищаем недокачанные файлы от предыдущей попытки
         for leftover in out_dir.iterdir():
             if leftover.is_file():
@@ -3454,10 +4032,12 @@ def _download_media_sync(
             "merge_output_format": "mp4",
             "playlist_items": "1",
             "outtmpl": str(out_dir / "%(title).80s [%(id)s].%(ext)s"),
-            "progress_hooks": _progress_hook(on_progress, budget),
+            "progress_hooks": _progress_hook(on_progress, budget, cancel),
         }
         try:
-            data = _extract_with_rescue(url, opts, download=True)
+            data = _extract_with_rescue(url, opts, download=True, cancel=cancel)
+        except DownloadCancelled:
+            raise
         except _TooBig:
             # скачивание прервано на лимите — пробуем качество пониже
             too_big = True
@@ -3482,9 +4062,14 @@ def _download_media_sync(
         )
 
     if last_error is not None:
+        if reddit_error is not None:
+            raise reddit_error
         if cobalt_error and _yt_bot_check(last_error):
             raise DownloadError(cobalt_error)
         raise DownloadError(friendly_error(last_error, url))
+
+    if reddit_error is not None:
+        raise reddit_error
 
     raise DownloadError(
         f"Скачать не удалось: файл весит больше {MAX_UPLOAD_MB} МБ "
@@ -3493,11 +4078,13 @@ def _download_media_sync(
 
 
 async def download_media(
-    url: str, out_dir: Path, on_progress=None
+    url: str, out_dir: Path, on_progress=None, cancel=None
 ) -> tuple[Path, dict]:
     try:
-        return await asyncio.to_thread(_download_media_sync, url, out_dir, on_progress)
-    except DownloadError:
+        return await asyncio.to_thread(
+            _download_media_sync, url, out_dir, on_progress, cancel
+        )
+    except (DownloadError, DownloadCancelled):
         raise
     except Exception as exc:  # noqa: BLE001
         log.exception("media download failed: %s", url)

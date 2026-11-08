@@ -7,6 +7,7 @@ import logging
 import re
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -33,8 +34,10 @@ from config import DOWNLOADS_DIR, MAX_UPLOAD_MB
 from downloader import (
     AUDIO_EXTS,
     SEMAPHORE as _semaphore,
+    DownloadCancelled,
     DownloadError,
     Track,
+    cobalt_services_report,
     download_audio,
     download_media,
     fa_diagnose,
@@ -53,6 +56,14 @@ PAGE_SIZE = 8
 SEARCH_LIMIT = 40  # ~5 страниц по 8 кнопок: оригинал обычно ниже каверов
 SESSION_TTL = 30 * 60  # полчаса — потом меню считается устаревшим
 
+NO_KB = InlineKeyboardMarkup(inline_keyboard=[])
+
+# Активные скачивания: token → событие отмены. Кнопка «⏹ Остановить»
+# появляется только у долгих загрузок, чтобы не мелькать зря.
+_stop_jobs: dict[str, tuple[threading.Event, float]] = {}
+_services_cache: tuple[float, str] | None = None
+SERVICES_TTL = 5 * 60
+
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".gif"}
@@ -60,11 +71,15 @@ VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".gif"}
 START_TEXT = (
     "👋 <b>Привет! Я умею две вещи:</b>\n\n"
     "🎵 <b>Музыка</b> — пришли название трека или «исполнитель - название», "
-    "я найду варианты и пришлю mp3.\n\n"
+    "я найду варианты (Hitmo, Zvyki, SoundCloud, YouTube) и пришлю mp3.\n\n"
     "📥 <b>Медиа по ссылке</b> — кинь ссылку на YouTube, TikTok, VK, Twitter/X, "
     "Instagram, Reddit, Rutube, Vimeo, SoundCloud, FurAffinity и многое другое — пришлю файл.\n\n"
     "💬 <b>В любом чате</b> — набери <code>@имя_бота</code> и ссылку или название трека, "
     "не добавляя меня в чат.\n\n"
+    "🧩 <b>Сервисы</b> — кнопка ниже покажет всё, что умеет бот: какие сайты "
+    "качаются через cobalt, а какие — своим путём.\n\n"
+    "Долгое скачивание можно прервать кнопкой «⏹ Остановить», она появляется "
+    "под сообщением через несколько секунд.\n\n"
     "Лимит Telegram — 50 МБ на файл, поэтому видео автоматически ужимается по качеству."
 )
 
@@ -78,11 +93,14 @@ HELP_TEXT = (
     "• <code>https://vk.ru/video...</code> или <code>vk.ru/wall...</code> — видео из VK\n"
     "• <code>https://www.furaffinity.net/view/12345678/</code> — картинка с FurAffinity\n"
     "• <code>@имя_бота https://tiktok.com/...</code> — прямо в любом чате\n"
+    "• <code>/services</code> или кнопка «🧩 Сервисы» — все доступные сервисы\n"
     "• <code>/yt_debug https://youtu.be/...</code> — почему YouTube не качается\n\n"
     "YouTube качается напрямую (yt-dlp + cookies из COOKIES_FILE). Instagram,\n"
     "Reddit и Rutube сначала идут через cobalt. Если сервис просит вход,\n"
     "добавьте COBALT_API (свой cobalt) или cookies. Остальные ссылки качает yt-dlp.\n"
-    "Ссылки на посты Telegram не поддерживаются: для них нужен юзербот."
+    "Ссылки на посты Telegram не поддерживаются: для них нужен юзербот.\n\n"
+    "Если скачивание затянулось, под сообщением появится «⏹ Остановить» — "
+    "нажмите её, чтобы прервать загрузку."
 )
 
 
@@ -188,9 +206,62 @@ def _get_session(cb: CallbackQuery, sid: str) -> SearchSession | None:
 
 async def _cleanup_notice(target: Message, text: str) -> None:
     try:
-        await target.edit_text(text)
+        await target.edit_text(text, reply_markup=NO_KB)
     except Exception:  # noqa: BLE001 — сообщение могли удалить
         pass
+
+
+def _start_job() -> tuple[str, threading.Event]:
+    """Регистрирует скачивание и возвращает токен с событием отмены."""
+    token = uuid.uuid4().hex[:12]
+    event = threading.Event()
+    now = time.time()
+    for old, (_, created) in list(_stop_jobs.items()):
+        if now - created > 2 * 60 * 60:
+            _stop_jobs.pop(old, None)
+    _stop_jobs[token] = (event, now)
+    return token, event
+
+
+def _finish_job(token: str) -> None:
+    _stop_jobs.pop(token, None)
+
+
+def _stop_kb(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏹ Остановить", callback_data=f"stop:{token}")]
+        ]
+    )
+
+
+async def _show_stop_button(
+    status: Message,
+    token: str,
+    progress: "ProgressBar | None" = None,
+    delay: float = 8.0,
+) -> None:
+    """Показывает кнопку отмены, только если скачивание затянулось."""
+    await asyncio.sleep(delay)
+    markup = _stop_kb(token)
+    if progress is not None:
+        # прогресс-бар перерисовывает текст — пусть сохраняет нашу кнопку
+        progress.reply_markup = markup
+    try:
+        await status.edit_reply_markup(reply_markup=markup)
+    except Exception:  # noqa: BLE001 — сообщение могли удалить
+        pass
+
+
+async def _services_text() -> str:
+    """Список сервисов cobalt с небольшим кэшем, чтобы не дёргать инстанс."""
+    global _services_cache
+    now = time.time()
+    if _services_cache and now - _services_cache[0] < SERVICES_TTL:
+        return _services_cache[1]
+    report = await asyncio.to_thread(cobalt_services_report)
+    _services_cache = (now, report)
+    return report
 
 
 class ProgressBar:
@@ -208,6 +279,7 @@ class ProgressBar:
         self.interval = interval
         self.done = 0
         self.total: int | None = None
+        self.reply_markup: InlineKeyboardMarkup | None = None
         self._stopped = False
         self._task = asyncio.create_task(self._run())
 
@@ -235,7 +307,12 @@ class ProgressBar:
             if self._stopped or not self.done:
                 continue
             try:
-                await self.status.edit_text(self._text())
+                kwargs = (
+                    {"reply_markup": self.reply_markup}
+                    if self.reply_markup is not None
+                    else {}
+                )
+                await self.status.edit_text(self._text(), **kwargs)
             except Exception:  # noqa: BLE001 — «message is not modified» и подобное
                 pass
 
@@ -341,7 +418,7 @@ async def deliver(
 
     media, _ = _build_media(path, caption, title, performer, duration)
     try:
-        sent = await status.edit_media(media)
+        sent = await status.edit_media(media, reply_markup=NO_KB)
         _remember(sent, cache_key, cache_title)
         return sent
     except Exception as exc:  # noqa: BLE001
@@ -386,6 +463,22 @@ async def cmd_start(message: Message) -> None:
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT)
+
+
+@router.message(Command("services"))
+async def cmd_services(message: Message) -> None:
+    """Показывает все сервисы, которые умеет cobalt, и что включено в боте."""
+    status = await message.answer("🧩 Собираю список сервисов…")
+    try:
+        text = await _services_text()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("services report failed")
+        await _cleanup_notice(status, f"❌ Не удалось получить список: {html.escape(str(exc)[:160])}")
+        return
+    try:
+        await status.edit_text(text)
+    except Exception:  # noqa: BLE001
+        await message.answer(text)
 
 
 @router.message(Command("fa_debug"))
@@ -475,12 +568,44 @@ def _start_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="🎵 Найти музыку", callback_data="hint:music"))
     kb.row(InlineKeyboardButton(text="📥 Скачать по ссылке", callback_data="hint:link"))
+    kb.row(InlineKeyboardButton(text="🧩 Сервисы", callback_data="svc:show"))
     return kb.as_markup()
+
+
+@router.callback_query(F.data == "svc:show")
+async def cb_services(callback: CallbackQuery) -> None:
+    await callback.answer("Собираю список…")
+    try:
+        text = await _services_text()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("services report failed")
+        await callback.message.answer(
+            f"❌ Не удалось получить список сервисов: {html.escape(str(exc)[:160])}"
+        )
+        return
+    await callback.message.answer(text)
 
 
 @router.callback_query(F.data == "noop")
 async def cb_noop(callback: CallbackQuery) -> None:
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("stop:"))
+async def cb_stop(callback: CallbackQuery) -> None:
+    """Кнопка «⏹ Остановить»: поднимает событие, загрузчик сам прервётся."""
+    token = (callback.data or "")[5:]
+    job = _stop_jobs.get(token)
+    if not job:
+        await callback.answer("Это скачивание уже завершилось.", show_alert=False)
+        return
+    event, _ = job
+    event.set()
+    await callback.answer("Останавливаю…")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=NO_KB)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @router.callback_query(F.data.startswith("hint:"))
@@ -578,24 +703,33 @@ async def download_track(message: Message, track: Track) -> None:
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(dir=DOWNLOADS_DIR))
     progress = ProgressBar(status, f"⬇️ Качаю «{html.escape(track.title)}»")
+    token, cancel = _start_job()
+    stop_task = asyncio.create_task(_show_stop_button(status, token, progress))
     try:
+        error_text: str | None = None
         try:
             async with _semaphore:
                 path, info = await asyncio.wait_for(
-                    download_audio(track, tmp_dir, on_progress=progress.update), timeout=240
+                    download_audio(
+                        track, tmp_dir, on_progress=progress.update, cancel=cancel
+                    ),
+                    timeout=240,
                 )
+        except DownloadCancelled:
+            error_text = "⏹ Остановлено."
         except DownloadError as exc:
-            await _cleanup_notice(status, f"❌ {html.escape(str(exc))}")
-            return
+            error_text = f"❌ {html.escape(str(exc))}"
         except asyncio.TimeoutError:
-            await _cleanup_notice(status, "❌ Слишком долго. Попробуйте другой трек.")
-            return
+            error_text = "❌ Слишком долго. Попробуйте другой трек."
         except Exception:  # noqa: BLE001
             log.exception("track download failed: %s", track.url)
-            await _cleanup_notice(status, "❌ Не получилось скачать трек.")
-            return
+            error_text = "❌ Не получилось скачать трек."
         finally:
             await progress.stop()
+
+        if error_text:
+            await _cleanup_notice(status, error_text)
+            return
 
         size_mb = path.stat().st_size / (1024 * 1024)
         if size_mb > MAX_UPLOAD_MB:
@@ -616,6 +750,8 @@ async def download_track(message: Message, track: Track) -> None:
         log.exception("track send failed: %s", track.url)
         await _cleanup_notice(status, "❌ Не получилось отправить трек.")
     finally:
+        stop_task.cancel()
+        _finish_job(token)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -690,31 +826,41 @@ async def handle_link(message: Message, url: str) -> None:
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(dir=DOWNLOADS_DIR))
     progress = ProgressBar(status, "⬇️ Скачиваю…")
+    token, cancel = _start_job()
+    stop_task = asyncio.create_task(_show_stop_button(status, token, progress))
 
     try:
+        error_text: str | None = None
+        preview_url: str | None = None
         try:
             async with _semaphore:
                 path, info = await asyncio.wait_for(
-                    download_media(url, tmp_dir, on_progress=progress.update), timeout=600
+                    download_media(
+                        url, tmp_dir, on_progress=progress.update, cancel=cancel
+                    ),
+                    timeout=600,
                 )
+        except DownloadCancelled:
+            error_text = "⏹ Остановлено."
         except DownloadError as exc:
             # FA: файл не отдался, но ссылка на картинку есть — превью
             # подтянет сам Telegram, его краулер FurAffinity пускает
-            preview = getattr(exc, "image_url", None)
-            if preview:
-                await _fa_preview(status, preview, str(exc))
-                return
-            await _cleanup_notice(status, f"❌ {html.escape(str(exc))}")
-            return
+            preview_url = getattr(exc, "image_url", None)
+            error_text = f"❌ {html.escape(str(exc))}"
         except asyncio.TimeoutError:
-            await _cleanup_notice(status, "❌ Скачивание зависло. Попробуйте ещё раз.")
-            return
+            error_text = "❌ Скачивание зависло. Попробуйте ещё раз."
         except Exception:  # noqa: BLE001
             log.exception("media download failed: %s", url)
-            await _cleanup_notice(status, "❌ Не получилось скачать. Проверьте ссылку.")
-            return
+            error_text = "❌ Не получилось скачать. Проверьте ссылку."
         finally:
             await progress.stop()
+
+        if preview_url:
+            await _fa_preview(status, preview_url, error_text or "")
+            return
+        if error_text:
+            await _cleanup_notice(status, error_text)
+            return
 
         size_mb = path.stat().st_size / (1024 * 1024)
         if size_mb > MAX_UPLOAD_MB:
@@ -735,4 +881,6 @@ async def handle_link(message: Message, url: str) -> None:
         log.exception("media send failed: %s", url)
         await _cleanup_notice(status, "❌ Не получилось отправить файл.")
     finally:
+        stop_task.cancel()
+        _finish_job(token)
         shutil.rmtree(tmp_dir, ignore_errors=True)

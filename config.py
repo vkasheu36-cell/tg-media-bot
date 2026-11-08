@@ -93,9 +93,13 @@ COBALT_QUALITY: str = (os.getenv("COBALT_QUALITY") or "1080").strip()
 
 # Необязательно: какие сервисы сначала отдавать в cobalt (через запятую).
 # YouTube сюда не входит — для него отдельный переключатель COBALT_YOUTUBE.
-# Остальные сервисы качаются прежним путём (yt-dlp и свои разборы).
+# По умолчанию all — все сервисы, которые умеет cobalt (кроме YouTube):
+# instagram,reddit,rutube,tiktok,twitter,soundcloud,facebook,vimeo,twitch,
+# dailymotion,vk,ok,pinterest,tumblr,snapchat,streamable,newgrounds,bilibili,
+# bluesky,loom. Список можно сузить вручную, none — cobalt не использовать.
+# Если cobalt не справился, бот всё равно откатывается на yt-dlp/свой разбор.
 COBALT_SERVICES: str = (
-    os.getenv("COBALT_SERVICES") or "instagram,reddit,rutube"
+    os.getenv("COBALT_SERVICES") or "all"
 ).strip()
 
 # Необязательно: прокси только для запросов в cobalt (не для Telegram).

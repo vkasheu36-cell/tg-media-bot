@@ -26,9 +26,9 @@ Long polling на Render не годится — платформа ждёт о�
    - `BOT_TOKEN` = токен от @BotFather;
    - `MAX_UPLOAD_MB` = `49` (необязательно);
    - `FA_COOKIE` = `a=…; b=…` для работ FurAffinity 18+ (необязательно);
-   - `COBALT_API` = `https://ваш-cobalt|Api-Key …` для Instagram/Reddit/Rutube (необязательно);
+   - `COBALT_API` = `https://ваш-cobalt|Api-Key …` для TikTok/Instagram/Reddit/Rutube/VK/Pinterest и других (необязательно);
    - `COBALT_YOUTUBE` = `1` — гнать YouTube через cobalt (по умолчанию `0`: yt-dlp + cookies);
-   - `COBALT_SERVICES` = `instagram,reddit,rutube` (необязательно);
+   - `COBALT_SERVICES` = `all` — все сервисы cobalt, кроме YouTube (необязательно; `none` выключает);
    - `COOKIES_FILE` = `/etc/secrets/cookies.txt` (Secret File) — для YouTube и Instagram.
 5. **Create Web Service** и подождать 3–5 минут сборки.
 
@@ -185,9 +185,9 @@ PO-токены (провайдер `POT_SERVER`).
 
 Cookies — это доступ к аккаунту: не публикуйте файл и не пересылайте его в чат.
 
-Instagram/Reddit/Rutube: бот сначала пробует `COBALT_API` (если задан), затем
-обычный yt-dlp. Список сервисов — `COBALT_SERVICES` (по умолчанию
-`instagram,reddit,rutube`).
+TikTok/Instagram/Reddit/Rutube/VK/Pinterest и остальные сервисы: бот сначала
+пробует `COBALT_API` (если задан), затем обычный yt-dlp или свой разбор.
+Список сервисов — `COBALT_SERVICES` (по умолчанию `all`, кроме YouTube).
 
 Важно: публичный `api.cobalt.tools` YouTube **не поддерживает**, а бесплатные
 публичные инстансы требуют токен turnstile (`error.api.auth.jwt.missing`).

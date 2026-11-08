@@ -59,7 +59,9 @@ log = logging.getLogger(__name__)
 router = Router()
 
 SEARCH_TTL = 10 * 60
-SEARCH_WAIT = 5.0  # столько inline-ответ ждёт поиск, дальше отвечаем тем, что есть
+# Telegram ждёт inline-ответ примерно 10 секунд, дальше показывает
+# «Показать в боте». Оставляем запас на отправку результатов.
+SEARCH_WAIT = 8.5  # столько inline-ответ ждёт поиск, дальше отвечаем тем, что есть
 _search_cache: dict[str, tuple[float, list[Track]]] = {}
 _search_tasks: dict[str, asyncio.Task] = {}
 _bg_tasks: set[asyncio.Task] = set()

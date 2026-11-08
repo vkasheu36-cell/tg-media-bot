@@ -777,6 +777,489 @@ class _RedditExternal(Exception):
         self.url = url
 
 
+# ---------------------------------------------------------------- Pinterest
+# Публичная страница пина отдаётся без входа, но собирается React'ом: og-тегов
+# почти нет. Зато в HTML есть <link id="pin-image-preload"> и Relay-данные с
+# ссылками на оригинал/видео. Короткие pin.it раскрываем вручную: истёкшие
+# ведут на главную, и тогда честно просим полную ссылку /pin/<id>/.
+
+_PINTEREST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+_PINTEREST_PIN_RE = re.compile(r"/pin/(\d+)", re.I)
+_PINTEREST_VIDEO_RE = re.compile(
+    r"https?://[A-Za-z0-9.-]*pinimg\.com/videos/[^\"'\s<>\\]+?\.mp4[^\"'\s<>\\]*",
+    re.I,
+)
+_PINTEREST_ORIGINAL_RE = re.compile(
+    r"https?://i\.pinimg\.com/originals/[^\"'\s<>\\]+", re.I
+)
+_PINTEREST_IMAGE_RE = re.compile(
+    r"https?://i\.pinimg\.com/(?:originals|736x|564x|474x|236x)/[^\"'\s<>\\]+",
+    re.I,
+)
+
+
+class _PinterestNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+def _is_pinterest(url: str) -> bool:
+    host = (urlsplit(url).netloc or "").lower()
+    if host.startswith(("www.", "m.", "ru.", "mobile.")):
+        host = host.split(".", 1)[1]
+    return host == "pin.it" or host.endswith("pinterest.com") or host.startswith(
+        "pinterest."
+    )
+
+
+def _pinterest_location(url: str) -> str:
+    """Один шаг редиректа: возвращает Location, не скачивая тело."""
+    opener = urllib.request.build_opener(_PinterestNoRedirect)
+    request = urllib.request.Request(url, headers=_PINTEREST_HEADERS)
+    try:
+        with opener.open(request, timeout=20) as response:
+            return response.geturl()
+    except urllib.error.HTTPError as exc:
+        location = exc.headers.get("Location") or exc.headers.get("location")
+        if location:
+            return urllib.parse.urljoin(url, location)
+        raise
+
+
+def _pinterest_canonical(url: str) -> str:
+    """Раскрывает pin.it и приводит ссылку к /pin/<id>/."""
+    current = url
+    for _ in range(6):
+        parts = urlsplit(current)
+        match = _PINTEREST_PIN_RE.search(parts.path)
+        if match and "pinterest." in parts.netloc.lower():
+            return f"https://www.pinterest.com/pin/{match.group(1)}/"
+
+        host = (parts.netloc or "").lower()
+        short = (
+            host == "pin.it"
+            or host.endswith(".pin.it")
+            or host == "api.pinterest.com"
+            or "/url_shortener/" in parts.path
+        )
+        if not short:
+            break
+        try:
+            current = _pinterest_location(current)
+        except urllib.error.HTTPError as exc:
+            raise DownloadError(
+                f"Pinterest: короткая ссылка не раскрылась (HTTP {exc.code}). "
+                "Пришлите полную ссылку вида https://www.pinterest.com/pin/<id>/"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise DownloadError(
+                "Pinterest: не удалось открыть короткую ссылку pin.it. "
+                "Пришлите полную ссылку вида https://www.pinterest.com/pin/<id>/"
+            ) from exc
+
+    parts = urlsplit(current)
+    match = _PINTEREST_PIN_RE.search(parts.path)
+    if match:
+        return f"https://www.pinterest.com/pin/{match.group(1)}/"
+
+    raise DownloadError(
+        "Pinterest: короткая ссылка pin.it уже не ведёт на пин (Pinterest "
+        "отправил на главную). Такие ссылки истекают — пришлите полную ссылку "
+        "из адресной строки вида https://www.pinterest.com/pin/<id>/"
+    )
+
+
+def _pinterest_opener() -> urllib.request.OpenerDirector:
+    """Браузерный opener с cookies из COOKIES_FILE (для закрытых пинов)."""
+    handlers: list[urllib.request.BaseHandler] = []
+    if COOKIES_FILE:
+        try:
+            jar = http.cookiejar.MozillaCookieJar(str(COOKIES_FILE))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            handlers.append(urllib.request.HTTPCookieProcessor(jar))
+        except Exception as exc:  # noqa: BLE001 — без cookies тоже работает
+            log.debug("Pinterest: cookies не загрузились: %s", exc)
+    return urllib.request.build_opener(*handlers)
+
+
+def _pinterest_page(url: str) -> str:
+    opener = _pinterest_opener()
+    request = urllib.request.Request(url, headers=_PINTEREST_HEADERS)
+    try:
+        with opener.open(request, timeout=30) as response:
+            return response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise DownloadError("Pinterest: пин не найден или удалён.") from exc
+        if exc.code in {401, 403}:
+            raise DownloadError(
+                "Pinterest: страница закрыта. Нужны cookies аккаунта "
+                "(COOKIES_FILE) или ссылка на публичный пин."
+            ) from exc
+        raise DownloadError(f"Pinterest: страница ответила HTTP {exc.code}.") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise DownloadError(
+            f"Pinterest: не удалось открыть страницу ({str(exc)[:120]})."
+        ) from exc
+
+
+def _pinterest_text(body: str) -> str:
+    """Раскодирует JS/JSON-экранирование, чтобы ссылки стали обычными."""
+    text = html.unescape(body).replace("\\/", "/")
+    text = re.sub(r"\\u002[fF]", "/", text)
+    text = re.sub(r"\\u0026", "&", text)
+    return text
+
+
+def _pinterest_original(image_url: str) -> str:
+    """736x/… → originals/…: та же картинка, но в полном размере."""
+    match = re.search(
+        r"i\.pinimg\.com/(?:736x|564x|474x|236x)/"
+        r"([0-9a-f]{2})/([0-9a-f]{2})/([0-9a-f]{2})/([0-9a-f]+)\.(\w+)",
+        image_url,
+        re.I,
+    )
+    if match:
+        a, b, c, name, ext = match.groups()
+        return f"https://i.pinimg.com/originals/{a}/{b}/{c}/{name}.{ext}"
+    return image_url
+
+
+def _pinterest_media(body: str) -> tuple[str, str] | None:
+    """Что в пине: ("video"|"image", прямой URL)."""
+    text = _pinterest_text(body)
+
+    videos = []
+    for candidate in _PINTEREST_VIDEO_RE.findall(text):
+        low = candidate.lower()
+        if "hevc" in low or "h265" in low:
+            continue  # Telegram не всегда проигрывает HEVC
+        videos.append(candidate)
+    if videos:
+        def rank(item: str) -> int:
+            low = item.lower()
+            score = 0
+            if "expmp4" in low:
+                score -= 60
+            if "720w" in low or "720p" in low:
+                score -= 30
+            elif "540w" in low or "540p" in low:
+                score -= 20
+            elif "480w" in low:
+                score -= 15
+            if "_t1" in low or "_t2" in low:
+                score += 30
+            return score
+
+        return "video", sorted(set(videos), key=rank)[0]
+
+    # 1) ссылка из preload — это именно картинка самого пина
+    for tag in re.findall(r"<link\b[^>]*>", body, re.I):
+        if "pin-image-preload" not in tag.lower():
+            continue
+        href = re.search(r'\bhref\s*=\s*["\']([^"\']+)["\']', tag, re.I)
+        if href:
+            return "image", _pinterest_original(html.unescape(href.group(1)))
+
+    # 2) обычные og/twitter-теги (бывают у части пинов)
+    for key in ("og:image:secure_url", "og:image", "twitter:image"):
+        value = _meta_value(body, key)
+        if value:
+            if value.startswith("//"):
+                value = "https:" + value
+            if value.startswith("http"):
+                return "image", _pinterest_original(value)
+
+    # 3) Relay-данные: первый originals обычно принадлежит самому пину
+    originals = _PINTEREST_ORIGINAL_RE.findall(text)
+    if originals:
+        return "image", originals[0]
+    images = _PINTEREST_IMAGE_RE.findall(text)
+    if images:
+        return "image", _pinterest_original(images[0])
+    return None
+
+
+def _js_unescape(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except Exception:  # noqa: BLE001
+        return value
+
+
+def _pinterest_title(body: str, pin_id: str) -> str:
+    def clean(value: str) -> str:
+        return " ".join(value.split())[:200]
+
+    for key in ("og:title", "twitter:title"):
+        value = _meta_value(body, key)
+        low = value.lower()
+        if value and low not in {"pinterest", "пин на доске"} and not low.startswith(
+            "пин на доске"
+        ):
+            return clean(value)
+
+    text = _pinterest_text(body)
+    start = text.find('"v3GetPinQueryv2"')
+    window = text[start : start + 60_000] if start != -1 else text[:60_000]
+    for pattern in (
+        r'"description"\s*:\s*"((?:[^"\\]|\\.){3,400})"',
+        r'"grid_title"\s*:\s*"((?:[^"\\]|\\.){1,160})"',
+        r'"title"\s*:\s*"((?:[^"\\]|\\.){1,160})"',
+    ):
+        match = re.search(pattern, window)
+        if not match:
+            continue
+        value = _js_unescape(match.group(1)).strip()
+        if value and value.lower() not in {"pinterest", "pin"}:
+            return clean(value)
+
+    match = re.search(r"<title>(.*?)</title>", body, re.S | re.I)
+    if match:
+        value = html.unescape(match.group(1)).strip()
+        if value and value.lower() not in {"pinterest", "пин на доске"}:
+            return clean(value)
+    return f"Pinterest {pin_id}"
+
+
+def _pinterest_download_direct(
+    media_url: str,
+    dest: Path,
+    referer: str,
+    on_progress=None,
+    cancel=None,
+) -> int:
+    request = urllib.request.Request(
+        media_url,
+        headers={**_PINTEREST_HEADERS, "Referer": referer, "Accept": "*/*"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        total = response.headers.get("Content-Length")
+        total = int(total) if total and total.isdigit() else None
+        done = 0
+        try:
+            with dest.open("wb") as fh:
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        raise DownloadCancelled()
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    done += len(chunk)
+                    if on_progress:
+                        on_progress(done, total)
+        except BaseException:
+            dest.unlink(missing_ok=True)
+            raise
+    return done
+
+
+def _pinterest_curl_download(
+    media_url: str,
+    dest: Path,
+    referer: str,
+    proxy: str,
+    on_progress=None,
+    cancel=None,
+) -> int:
+    """Запасной путь через WARP: CDN Pinterest иногда рвёт прямой коннект."""
+    curl = shutil.which("curl")
+    if not curl:
+        raise DownloadError("Pinterest: CDN не отдал файл, а curl для обхода нет.")
+    cmd = [
+        curl,
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--max-time",
+        "300",
+        "--proxy",
+        proxy,
+        "--user-agent",
+        _PINTEREST_HEADERS["User-Agent"],
+        "--referer",
+        referer,
+        "--output",
+        str(dest),
+        media_url,
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise DownloadError(f"Pinterest: curl не запустился ({exc}).") from exc
+
+    try:
+        while proc.poll() is None:
+            if cancel is not None and cancel.is_set():
+                proc.kill()
+                raise DownloadCancelled()
+            if on_progress and dest.exists():
+                on_progress(dest.stat().st_size, None)
+            time.sleep(0.25)
+        stderr = (proc.stderr.read() or b"").decode("utf-8", "replace") if proc.stderr else ""
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    if proc.returncode != 0 or not dest.exists():
+        dest.unlink(missing_ok=True)
+        raise DownloadError(
+            f"Pinterest: CDN не отдал файл даже через WARP ({stderr[:160]})."
+        )
+    return dest.stat().st_size
+
+
+def _pinterest_download_file(
+    media_url: str,
+    dest: Path,
+    referer: str,
+    on_progress=None,
+    cancel=None,
+) -> int:
+    try:
+        return _pinterest_download_direct(
+            media_url, dest, referer, on_progress, cancel
+        )
+    except DownloadCancelled:
+        raise
+    except urllib.error.HTTPError as exc:
+        dest.unlink(missing_ok=True)
+        raise DownloadError(
+            f"Pinterest: файл не скачался (HTTP {exc.code})."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — обрыв на CDN лечим WARP
+        dest.unlink(missing_ok=True)
+        proxy = _yt_proxy()
+        if not proxy:
+            raise DownloadError(
+                f"Pinterest: CDN не отдал файл ({str(exc)[:120]})."
+            ) from exc
+        log.warning("Pinterest: прямой CDN не отдал файл (%s), пробую WARP", exc)
+        return _pinterest_curl_download(
+            media_url, dest, referer, proxy, on_progress, cancel
+        )
+
+
+def _extract_mp3(src: Path, dest: Path) -> bool:
+    """Вытащить звук из видео Pinterest через ffmpeg."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-vn",
+        "-acodec",
+        "libmp3lame",
+        "-q:a",
+        "2",
+        str(dest),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0 or not dest.exists() or dest.stat().st_size < 10_000:
+        log.warning("Pinterest: ffmpeg не извлёк звук: %s", result.stderr[-300:])
+        return False
+    return True
+
+
+def _pinterest_download_sync(
+    url: str,
+    out_dir: Path,
+    mode: str = "auto",
+    on_progress=None,
+    cancel=None,
+) -> tuple[Path, dict]:
+    """Пин без входа: короткая ссылка → страница → видео или картинка."""
+    if cancel is not None and cancel.is_set():
+        raise DownloadCancelled()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    canonical = _pinterest_canonical(url)
+    pin_match = _PINTEREST_PIN_RE.search(urlsplit(canonical).path)
+    pin_id = pin_match.group(1) if pin_match else ""
+
+    body = _pinterest_page(canonical)
+    media = _pinterest_media(body)
+    if not media:
+        raise DownloadError(
+            "Pinterest: на странице пина не нашлось ни видео, ни картинки. "
+            "Возможно, это текстовый пин или страница не догрузилась."
+        )
+
+    kind, media_url = media
+    info = {
+        "id": pin_id,
+        "title": _pinterest_title(body, pin_id),
+        "uploader": "",
+        "duration": 0,
+        "webpage_url": canonical,
+    }
+
+    if kind == "image":
+        if mode == "audio":
+            raise DownloadError(
+                "Pinterest: в этом пине картинка, звуковой дорожки нет. "
+                "Выберите «Фото-видео» — пришлю изображение."
+            )
+        ext = _guess_ext(media_url)
+        if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            ext = ".jpg"
+        if ext == ".jpeg":
+            ext = ".jpg"
+        path = out_dir / f"pinterest{ext}"
+        size = _pinterest_download_file(
+            media_url, path, canonical, on_progress, cancel
+        )
+        if size < 1024:
+            raise DownloadError("Pinterest: картинка пришла пустой.")
+        log.info("Pinterest: картинка %s (%s байт)", media_url, size)
+        return path, info
+
+    video = out_dir / "pinterest.mp4"
+    size = _pinterest_download_file(media_url, video, canonical, on_progress, cancel)
+    if size < 10_000:
+        raise DownloadError("Pinterest: видео пришло пустым.")
+
+    if mode == "audio":
+        audio = out_dir / "pinterest.mp3"
+        if not _extract_mp3(video, audio):
+            video.unlink(missing_ok=True)
+            raise DownloadError(
+                "Pinterest: не удалось извлечь звук (нужен ffmpeg). "
+                "Выберите «Фото-видео» — пришлю видео."
+            )
+        video.unlink(missing_ok=True)
+        log.info("Pinterest: звук из видео %s", media_url)
+        return audio, info
+
+    if video.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
+        video.unlink(missing_ok=True)
+        raise DownloadError(
+            f"Pinterest: видео больше {MAX_UPLOAD_MB} МБ — Telegram не примет. "
+            "Выберите «Только звук»."
+        )
+    log.info("Pinterest: видео %s (%s байт)", media_url, size)
+    return video, info
+
 
 def _dns_retry(func, attempts: int = 3, delay: float = 1.5):
     """DNS через VPN иногда отвечает «getaddrinfo failed» — повторяем запрос."""
@@ -1806,9 +2289,18 @@ def _cobalt_auth(auth: str) -> str:
 
 
 def _cobalt_services() -> set[str]:
-    """Список сервисов из COBALT_SERVICES (YouTube задаётся отдельно)."""
+    """Список сервисов из COBALT_SERVICES (YouTube задаётся отдельно).
+
+    ``all``/``*`` — все сервисы, которые умеет cobalt, кроме YouTube.
+    ``none``/``off`` — не отдавать в cobalt ничего (только yt-dlp).
+    """
     raw = (COBALT_SERVICES or "").replace("\\n", ",")
-    return {chunk.strip().lower() for chunk in raw.split(",") if chunk.strip()}
+    items = {chunk.strip().lower() for chunk in raw.split(",") if chunk.strip()}
+    if not items or items & {"none", "off", "0", "no"}:
+        return set()
+    if items & {"all", "*"}:
+        return {name for name in _COBALT_HOSTS if name != "youtube"}
+    return items
 
 
 def _cobalt_service(url: str) -> str | None:
@@ -2339,11 +2831,27 @@ def _rank_tracks(query: str, tracks: list[Track]) -> list[Track]:
     return sorted(tracks, key=score, reverse=True)
 
 
+def _collect_search(tasks: list[asyncio.Task]) -> list[Track]:
+    """Забирает готовые результаты, а незавершённые отпускает в фон."""
+    tracks: list[Track] = []
+    for task in tasks:
+        if task.done():
+            if task.cancelled() or task.exception() is not None:
+                continue
+            tracks.extend(task.result())
+        else:
+            # Не оставляем «exception was never retrieved», когда задача
+            # доработает уже после ответа inline-клиенту.
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
+    return tracks
+
+
 async def search(query: str, limit: int = 12, budget: float | None = None) -> list[Track]:
     """Ищет треки: Hitmo и Zvyki (готовые файлы), затем SoundCloud и YouTube.
 
-    ``budget`` — сколько секунд ждать (для inline-режима). Если Hitmo уже дал
-    достаточно результатов, медленные источники не трогаем вовсе.
+    ``budget`` — сколько секунд ждать (для inline-режима). В inline все
+    источники стартуют параллельно: Telegram ждёт ответ всего ~10 секунд,
+    и последовательный Hitmo просто не оставлял времени остальным.
     """
     deadline = time.monotonic() + budget if budget else None
 
@@ -2352,39 +2860,37 @@ async def search(query: str, limit: int = 12, budget: float | None = None) -> li
     parts = _split_query(query)
     query_for_search = " ".join(parts) if parts else query
 
-    hm_timeout = 12.0 if deadline is None else max(1.0, min(12.0, deadline - time.monotonic()))
-    try:
-        tracks = await asyncio.wait_for(
-            _search_one(query_for_search, "hm", min(limit, 30)), timeout=hm_timeout
-        )
-    except Exception:  # noqa: BLE001 — таймаут или сбой Hitmo
-        tracks = []
-
-    # Hitmo редко отдаёт больше десятка треков — добираем Zvyki, SoundCloud
-    # и YouTube, иначе список обрывается на нескольких результатах.
-    if len(tracks) < limit:
-        needed = max(4, limit - len(tracks))
+    if deadline is not None:
+        # Inline: Hitmo, Zvyki, SoundCloud и YouTube одновременно. Что успело
+        # за отведённое время — отдаём, остальное продолжает догружаться в фоне.
         tasks = [
-            asyncio.create_task(_search_one(query_for_search, provider, needed))
-            for provider in ("zv", "sc", "yt")
+            asyncio.create_task(_search_one(query_for_search, provider, limit))
+            for provider in ("hm", "zv", "sc", "yt")
         ]
-        if deadline is not None:
-            wait_for_extra = max(0.0, deadline - time.monotonic())
-        elif tracks:
-            # Hitmo уже что-то нашёл — даём остальным (особенно YouTube)
-            # несколько секунд, но не заставляем человека ждать слишком долго
-            wait_for_extra = 8.0
-        else:
-            wait_for_extra = 20.0
+        wait_time = max(0.5, deadline - time.monotonic())
+        await asyncio.wait(set(tasks), timeout=wait_time)
+        tracks = _collect_search(tasks)
+    else:
+        hm_timeout = 12.0
+        try:
+            tracks = await asyncio.wait_for(
+                _search_one(query_for_search, "hm", min(limit, 30)),
+                timeout=hm_timeout,
+            )
+        except Exception:  # noqa: BLE001 — таймаут или сбой Hitmo
+            tracks = []
 
-        if wait_for_extra > 0:
+        # Hitmo редко отдаёт больше десятка треков — добираем Zvyki, SoundCloud
+        # и YouTube, иначе список обрывается на нескольких результатах.
+        if len(tracks) < limit:
+            needed = max(4, limit - len(tracks))
+            tasks = [
+                asyncio.create_task(_search_one(query_for_search, provider, needed))
+                for provider in ("zv", "sc", "yt")
+            ]
+            wait_for_extra = 8.0 if tracks else 20.0
             await asyncio.wait(set(tasks), timeout=wait_for_extra)
-
-        for task in tasks:
-            if task.done() and not task.cancelled() and task.exception() is None:
-                tracks.extend(task.result())
-            elif not task.done():
-                task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            tracks.extend(_collect_search(tasks))
 
     unique: list[Track] = []
     seen: set[str] = set()
@@ -2487,6 +2993,10 @@ def _download_audio_sync(
         return _hitmo_download_sync(track, out_dir, on_progress, cancel)
     if track.provider == "zv":
         return _zvyki_download_sync(track, out_dir, on_progress, cancel)
+    if _is_pinterest(track.url):
+        return _pinterest_download_sync(
+            track.url, out_dir, "audio", on_progress, cancel
+        )
     if _is_hitmo(track.url):
         # ссылка на страницу трека из Hitmo: разбираем её и качаем mp3
         return _hitmo_from_url_sync(track.url, out_dir, on_progress, cancel)
@@ -3902,6 +4412,10 @@ def _download_media_sync(
             cobalt_error = str(exc)
             log.warning("cobalt не осилил %s: %s", url, exc)
             _clear_dir(out_dir)
+
+    # Pinterest: cobalt часто требует токен, поэтому есть свой разбор страницы.
+    if _is_pinterest(url):
+        return _pinterest_download_sync(url, out_dir, "auto", on_progress, cancel)
 
     # VK: vk.ru → vk.com (yt-dlp понимает посты на стене только на vk.com)
     if _is_vk(url):

@@ -52,7 +52,7 @@ from downloader import (
     resolve_music_link,
     search,
 )
-from handlers import IMAGE_EXTS, _media_caption, _track_label, safe_filename
+from handlers import IMAGE_EXTS, VIDEO_EXTS, _media_caption, _track_label, safe_filename
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -431,8 +431,24 @@ async def _inline_media(
                 )
 
         _check_size(path)
-        media = _build_inline_media(path, info, url, mode)
-        await _edit_inline(bot, inline_message_id, media, path, info, url, mode, user_id)
+        settings = storage.get_settings(user_id)
+        as_file = settings["send_as_file"]
+        keep_source = settings["keep_source"]
+        media = _build_inline_media(
+            path, info, url, mode, as_file=as_file, keep_source=keep_source
+        )
+        await _edit_inline(
+            bot,
+            inline_message_id,
+            media,
+            path,
+            info,
+            url,
+            mode,
+            user_id,
+            as_file=as_file,
+            keep_source=keep_source,
+        )
     except DownloadCancelled:
         await _safe_edit_text(bot, inline_message_id, "⏹ Остановлено.")
     except DownloadError as exc:
@@ -505,6 +521,13 @@ async def _inline_track(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _upload_mode(path: Path, mode: str, as_file: bool) -> str:
+    """«как файл» превращает картинку/видео в документ, музыку не трогает."""
+    if as_file and mode != "audio" and path.suffix.lower() in IMAGE_EXTS | VIDEO_EXTS:
+        return "document"
+    return mode
+
+
 def _check_size(path: Path) -> None:
     size_mb = path.stat().st_size / (1024 * 1024)
     if size_mb > MAX_UPLOAD_MB:
@@ -522,6 +545,8 @@ async def _edit_inline(
     source_url: str,
     mode: str,
     user_id: int | None = None,
+    as_file: bool = False,
+    keep_source: bool = True,
 ) -> None:
     """Заменяет «Скачиваю…» на файл, перебирая способы.
 
@@ -530,10 +555,23 @@ async def _edit_inline(
     поэтому пробуем несколько вариантов, пока один не сработает.
     """
     caption = getattr(media, "caption", None) or ""
+    upload_mode = _upload_mode(path, mode, as_file)
 
     variants = [("загрузка файла", media)]
     if mode != "document":
-        variants.append(("файлом", _build_inline_media(path, info, source_url, "document")))
+        variants.append(
+            (
+                "файлом",
+                _build_inline_media(
+                    path,
+                    info,
+                    source_url,
+                    "document",
+                    as_file=as_file,
+                    keep_source=keep_source,
+                ),
+            )
+        )
 
     for name, item in variants:
         try:
@@ -554,8 +592,10 @@ async def _edit_inline(
     if user_id:
         sent = None
         try:
-            sent, file_id = await _upload_for_file_id(bot, user_id, path, mode)
-            item = _media_from_file_id(file_id, path, info, caption, mode)
+            sent, file_id = await _upload_for_file_id(
+                bot, user_id, path, upload_mode, caption
+            )
+            item = _media_from_file_id(file_id, path, info, caption, upload_mode)
             await _try_edit(bot, inline_message_id, item)
             log.info("inline: сработал вариант «file_id»")
             await _drop_keyboard(bot, inline_message_id)
@@ -572,7 +612,9 @@ async def _edit_inline(
 
     # совсем не вышло: честно пишем в сообщении, а файл отправляем в личку
     if user_id:
-        await _send_to_dm(bot, user_id, path, info, mode)
+        await _send_to_dm(
+            bot, user_id, path, info, upload_mode, keep_source=keep_source
+        )
         text = "✅ Файл отправил в личку с ботом."
     else:
         text = "❌ Не удалось показать файл здесь — вызовите бота в личке."
@@ -615,9 +657,17 @@ async def _upload_for_file_id(
 
 
 async def _send_to_dm(
-    bot: Bot, user_id: int, path: Path, info: dict, mode: str, source_url: str = ""
+    bot: Bot,
+    user_id: int,
+    path: Path,
+    info: dict,
+    mode: str,
+    source_url: str = "",
+    keep_source: bool = True,
 ) -> None:
-    caption = f'<a href="{html.escape(source_url)}">ссылка</a>' if source_url else ""
+    title = (info.get("title") or path.stem)[:180]
+    performer = (info.get("artist") or info.get("uploader") or "")[:120]
+    caption = _media_caption(path, title, performer, source_url, keep_source)
     try:
         await _upload_for_file_id(bot, user_id, path, mode, caption)
     except Exception as exc:  # noqa: BLE001
@@ -661,15 +711,22 @@ async def _try_edit(bot: Bot, inline_message_id: str, media) -> None:
         await bot.edit_message_media(media=media, inline_message_id=inline_message_id)
 
 
-def _build_inline_media(path: Path, info: dict, source_url: str, mode: str):
+def _build_inline_media(
+    path: Path,
+    info: dict,
+    source_url: str,
+    mode: str,
+    as_file: bool = False,
+    keep_source: bool = True,
+):
     ext = path.suffix.lower()
     title = (info.get("title") or path.stem)[:180]
     performer = (info.get("artist") or info.get("uploader") or "")[:120]
     duration = int(info.get("duration") or 0) or None
-    caption = _media_caption(path, title, performer, source_url)
+    caption = _media_caption(path, title, performer, source_url, keep_source)
     file = FSInputFile(path, filename=safe_filename(title, ext))
 
-    if mode == "document":
+    if mode == "document" or (as_file and ext in IMAGE_EXTS | VIDEO_EXTS):
         return InputMediaDocument(media=file, caption=caption)
     if ext in AUDIO_EXTS:
         return InputMediaAudio(

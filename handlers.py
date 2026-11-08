@@ -79,6 +79,8 @@ START_TEXT = (
     "не добавляя меня в чат.\n\n"
     "🧩 <b>Сервисы</b> — кнопка ниже покажет всё, что умеет бот: какие сайты "
     "качаются через cobalt, а какие — своим путём.\n\n"
+    "⚙️ <b>Настройки</b> — <code>/settings</code>: отправлять файлом без сжатия "
+    "или обычно, оставлять ли ссылку на источник.\n\n"
     "Долгое скачивание можно прервать кнопкой «⏹ Остановить», она появляется "
     "под сообщением через несколько секунд.\n\n"
     "Лимит Telegram — 50 МБ на файл, поэтому видео автоматически ужимается по качеству."
@@ -95,6 +97,8 @@ HELP_TEXT = (
     "• <code>https://www.furaffinity.net/view/12345678/</code> — картинка с FurAffinity\n"
     "• <code>@имя_бота https://tiktok.com/...</code> — прямо в любом чате\n"
     "• <code>/services</code> или кнопка «🧩 Сервисы» — все доступные сервисы\n"
+    "• <code>/settings</code> или кнопка «⚙️ Настройки» — «как файл»/«обычно» "
+    "и ссылка на источник\n"
     "• <code>/yt_debug https://youtu.be/...</code> — почему YouTube не качается\n\n"
     "YouTube качается напрямую (yt-dlp + cookies из COOKIES_FILE). Остальные\n"
     "сервисы сначала идут через cobalt, а если он не справился — через yt-dlp.\n"
@@ -349,7 +353,14 @@ def _remember(message: Message, key: str, title: str) -> None:
 # ---------------------------------------------------------------- доставка файла
 
 
-def _build_media(path: Path, caption: str, title: str, performer: str, duration: int | None):
+def _build_media(
+    path: Path,
+    caption: str,
+    title: str,
+    performer: str,
+    duration: int | None,
+    as_file: bool = False,
+):
     """InputMedia для edit_media — им же статус превращается в готовый файл."""
     ext = path.suffix.lower()
     file = FSInputFile(path, filename=safe_filename(title, ext))
@@ -357,6 +368,9 @@ def _build_media(path: Path, caption: str, title: str, performer: str, duration:
         return InputMediaAudio(
             media=file, caption=caption, title=title, performer=performer or None, duration=duration
         ), file
+    if as_file and ext in IMAGE_EXTS | VIDEO_EXTS:
+        # «как файл»: Telegram не пережимает картинку/видео.
+        return InputMediaDocument(media=file, caption=caption), file
     if ext in IMAGE_EXTS:
         return InputMediaPhoto(media=file, caption=caption), file
     if ext in VIDEO_EXTS:
@@ -367,7 +381,13 @@ def _build_media(path: Path, caption: str, title: str, performer: str, duration:
 
 
 async def _send_new(
-    status: Message, path: Path, caption: str, title: str, performer: str, duration: int | None
+    status: Message,
+    path: Path,
+    caption: str,
+    title: str,
+    performer: str,
+    duration: int | None,
+    as_file: bool = False,
 ) -> Message:
     ext = path.suffix.lower()
     file = FSInputFile(path, filename=safe_filename(title, ext))
@@ -375,6 +395,8 @@ async def _send_new(
         return await status.answer_audio(
             audio=file, caption=caption, title=title, performer=performer or None, duration=duration
         )
+    if as_file and ext in IMAGE_EXTS | VIDEO_EXTS:
+        return await status.answer_document(document=file, caption=caption)
     if ext in IMAGE_EXTS:
         return await status.answer_photo(photo=file, caption=caption)
     if ext in VIDEO_EXTS:
@@ -390,10 +412,14 @@ def _track_caption(title: str, performer: str) -> str:
     return " — ".join(parts)
 
 
-def _media_caption(path: Path, title: str, performer: str, source_url: str) -> str:
+def _media_caption(
+    path: Path, title: str, performer: str, source_url: str, keep_source: bool = True
+) -> str:
     if path.suffix.lower() in AUDIO_EXTS:
         return _track_caption(title, performer)
-    return f'<a href="{html.escape(source_url)}">ссылка</a>'
+    if keep_source and source_url:
+        return f'<a href="{html.escape(source_url)}">ссылка на источник</a>'
+    return ""
 
 
 async def deliver(
@@ -404,6 +430,7 @@ async def deliver(
     cache_key: str,
     fallback_title: str = "",
     fallback_performer: str = "",
+    user_id: int | None = None,
 ) -> Message | None:
     """Как у cobold: сообщение «скачиваю» превращается в готовое медиа.
 
@@ -414,10 +441,14 @@ async def deliver(
     title = (info.get("track") or info.get("title") or fallback_title or path.stem)[:180]
     performer = (info.get("artist") or info.get("uploader") or fallback_performer or "")[:120]
     duration = int(info.get("duration") or 0) or None
-    caption = _media_caption(path, title, performer, source_url)
+    settings = storage.get_settings(user_id)
+    as_file = settings["send_as_file"]
+    caption = _media_caption(
+        path, title, performer, source_url, settings["keep_source"]
+    )
     cache_title = f"{performer} - {title}" if performer else title
 
-    media, _ = _build_media(path, caption, title, performer, duration)
+    media, _ = _build_media(path, caption, title, performer, duration, as_file)
     try:
         sent = await status.edit_media(media, reply_markup=NO_KB)
         _remember(sent, cache_key, cache_title)
@@ -425,7 +456,9 @@ async def deliver(
     except Exception as exc:  # noqa: BLE001
         log.warning("edit_media failed (%s), falling back to new message", exc)
 
-    sent = await _send_new(status, path, caption, title, performer, duration)
+    sent = await _send_new(
+        status, path, caption, title, performer, duration, as_file
+    )
     _remember(sent, cache_key, cache_title)
     try:
         await status.delete()
@@ -480,6 +513,93 @@ async def cmd_services(message: Message) -> None:
         await status.edit_text(text)
     except Exception:  # noqa: BLE001
         await message.answer(text)
+
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message) -> None:
+    settings = storage.get_settings(message.from_user.id if message.from_user else None)
+    await message.answer(
+        _settings_text(settings), reply_markup=_settings_kb(settings)
+    )
+
+
+def _settings_text(settings: dict[str, bool]) -> str:
+    send_as_file = settings.get("send_as_file")
+    keep_source = settings.get("keep_source")
+    return (
+        "⚙️ <b>Настройки</b>\n\n"
+        "📤 <b>Отправка:</b> "
+        + ("как файл (без сжатия)" if send_as_file else "обычно")
+        + "\n"
+        "🔗 <b>Ссылка на источник:</b> "
+        + ("да" if keep_source else "нет")
+        + "\n\n"
+        "<i>Нажмите на пункт, чтобы переключить. Настройки личные — "
+        "у каждого пользователя свои.</i>"
+    )
+
+
+def _settings_kb(settings: dict[str, bool]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text=(
+                "📤 Отправка: как файл (без сжатия)"
+                if settings.get("send_as_file")
+                else "📤 Отправка: обычно"
+            ),
+            callback_data="set:file",
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text=(
+                "🔗 Ссылка на источник: да"
+                if settings.get("keep_source")
+                else "🔗 Ссылка на источник: нет"
+            ),
+            callback_data="set:src",
+        )
+    )
+    kb.row(InlineKeyboardButton(text="✖️ Закрыть", callback_data="set:close"))
+    return kb.as_markup()
+
+
+@router.callback_query(F.data.startswith("set:"))
+async def cb_settings(callback: CallbackQuery) -> None:
+    action = (callback.data or "").split(":", 1)[1]
+    user_id = callback.from_user.id if callback.from_user else None
+
+    if action == "close":
+        await callback.answer()
+        try:
+            await callback.message.delete()
+        except Exception:  # noqa: BLE001 — сообщение могли уже удалить
+            pass
+        return
+
+    if action == "menu":
+        await callback.answer()
+        settings = storage.get_settings(user_id)
+        await callback.message.answer(
+            _settings_text(settings), reply_markup=_settings_kb(settings)
+        )
+        return
+
+    key = {"file": "send_as_file", "src": "keep_source"}.get(action)
+    if key is None or user_id is None:
+        await callback.answer()
+        return
+
+    value = storage.toggle_setting(user_id, key)
+    settings = storage.get_settings(user_id)
+    try:
+        await callback.message.edit_text(
+            _settings_text(settings), reply_markup=_settings_kb(settings)
+        )
+    except Exception as exc:  # noqa: BLE001 — «message is not modified» и т.п.
+        log.debug("settings edit failed: %s", exc)
+    await callback.answer("Включено" if value else "Выключено")
 
 
 @router.message(Command("fa_debug"))
@@ -570,6 +690,7 @@ def _start_kb() -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="🎵 Найти музыку", callback_data="hint:music"))
     kb.row(InlineKeyboardButton(text="📥 Скачать по ссылке", callback_data="hint:link"))
     kb.row(InlineKeyboardButton(text="🧩 Сервисы", callback_data="svc:show"))
+    kb.row(InlineKeyboardButton(text="⚙️ Настройки", callback_data="set:menu"))
     return kb.as_markup()
 
 
@@ -698,7 +819,9 @@ async def handle_music(message: Message, query: str, status: Message | None = No
         await message.answer(text, reply_markup=results_keyboard(sid, 0, tracks))
 
 
-async def download_track(message: Message, track: Track) -> None:
+async def download_track(
+    message: Message, track: Track, user_id: int | None = None
+) -> None:
     status = await message.answer(f"⬇️ Качаю «{html.escape(track.title)}»…")
 
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -744,6 +867,7 @@ async def download_track(message: Message, track: Track) -> None:
             storage.normalize_url(track.url),
             fallback_title=track.title,
             fallback_performer=track.uploader,
+            user_id=user_id,
         )
     except DownloadError as exc:
         await _cleanup_notice(status, f"❌ {html.escape(str(exc))}")
@@ -788,7 +912,11 @@ async def cb_track(callback: CallbackQuery) -> None:
         return
 
     await callback.answer("Качаю…")
-    await download_track(callback.message, session.tracks[idx])
+    await download_track(
+        callback.message,
+        session.tracks[idx],
+        callback.from_user.id if callback.from_user else None,
+    )
 
 
 # ---------------------------------------------------------------- медиа по ссылке
@@ -875,6 +1003,7 @@ async def handle_link(message: Message, url: str) -> None:
             info,
             url,
             storage.normalize_url(url),
+            user_id=message.from_user.id if message.from_user else None,
         )
     except DownloadError as exc:
         await _cleanup_notice(status, f"❌ {html.escape(str(exc))}")

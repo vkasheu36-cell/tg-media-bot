@@ -37,9 +37,19 @@ _conn.executescript(
         payload    TEXT NOT NULL,
         created_at REAL NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS settings (
+        user_id    TEXT PRIMARY KEY,
+        payload    TEXT NOT NULL
+    );
     """
 )
 _conn.commit()
+
+# Настройки по умолчанию: как бот вёл себя до появления /settings.
+DEFAULT_SETTINGS: dict[str, bool] = {
+    "send_as_file": False,  # False — «обычно», True — документом без сжатия
+    "keep_source": True,  # оставлять ссылку на источник в подписи
+}
 
 
 def normalize_url(url: str) -> str:
@@ -125,3 +135,49 @@ def cleanup() -> None:
     _conn.execute("DELETE FROM pending WHERE created_at < ?", (now - PENDING_TTL,))
     _conn.execute("DELETE FROM media WHERE created_at < ?", (now - MEDIA_TTL,))
     _conn.commit()
+
+
+# ---------------------------------------------------------------- настройки
+
+
+def get_settings(user_id: int | str | None) -> dict[str, bool]:
+    """Настройки пользователя; по умолчанию — поведение без /settings."""
+    settings = dict(DEFAULT_SETTINGS)
+    if user_id is None:
+        return settings
+    row = _conn.execute(
+        "SELECT payload FROM settings WHERE user_id = ?", (str(user_id),)
+    ).fetchone()
+    if not row:
+        return settings
+    try:
+        saved = json.loads(row["payload"])
+    except Exception:  # noqa: BLE001 — битая запись не должна ломать бота
+        return settings
+    if isinstance(saved, dict):
+        for key in DEFAULT_SETTINGS:
+            if key in saved:
+                settings[key] = bool(saved[key])
+    return settings
+
+
+def save_settings(user_id: int | str, settings: dict) -> dict[str, bool]:
+    merged = {
+        key: bool(settings.get(key, default)) for key, default in DEFAULT_SETTINGS.items()
+    }
+    _conn.execute(
+        "INSERT OR REPLACE INTO settings VALUES (?, ?)",
+        (str(user_id), json.dumps(merged)),
+    )
+    _conn.commit()
+    return merged
+
+
+def toggle_setting(user_id: int | str, key: str) -> bool:
+    """Переключает настройку и возвращает новое значение."""
+    if key not in DEFAULT_SETTINGS:
+        raise KeyError(key)
+    settings = get_settings(user_id)
+    settings[key] = not settings[key]
+    save_settings(user_id, settings)
+    return settings[key]

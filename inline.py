@@ -31,7 +31,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineQuery,
     InlineQueryResultArticle,
-    InlineQueryResultsButton,
     InputMediaAudio,
     InputMediaDocument,
     InputMediaPhoto,
@@ -234,11 +233,13 @@ async def _answer_url(query: InlineQuery, url: str, username: str) -> None:
         )
 
     token = storage.save_pending({"kind": "query", "query": url})
-    button = InlineQueryResultsButton(
-        text="⬇️ Скачать в боте",
-        start_parameter=f"dl_{token}",
+    await query.answer(
+        results,
+        switch_pm_text="⬇️ Скачать в боте",
+        switch_pm_parameter=f"dl_{token}",
+        cache_time=0,
+        is_personal=True,
     )
-    await query.answer(results, button=button, cache_time=0, is_personal=True)
 
 
 async def _answer_music(query: InlineQuery, text: str, username: str) -> None:
@@ -270,11 +271,16 @@ async def _answer_music(query: InlineQuery, text: str, username: str) -> None:
         )
 
     token = storage.save_pending({"kind": "query", "query": text})
-    button = InlineQueryResultsButton(
-        text="🔎 Показать в боте",
-        start_parameter=f"q_{token}",
+    # Классический switch_pm, а не новый InlineQueryResultsButton: клиенты
+    # Telegram рисуют его строкой «Показать в боте» даже когда результатов
+    # ноль. Иначе при таймауте поиска не остаётся вообще ничего нажать.
+    await query.answer(
+        results,
+        switch_pm_text="🔎 Показать в боте",
+        switch_pm_parameter=f"q_{token}",
+        cache_time=0,
+        is_personal=True,
     )
-    await query.answer(results, button=button, cache_time=0, is_personal=True)
 
 
 # ---------------------------------------------------------------- выбран результат

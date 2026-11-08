@@ -799,6 +799,10 @@ _PINTEREST_VIDEO_RE = re.compile(
     r"https?://[A-Za-z0-9.-]*pinimg\.com/videos/[^\"'\s<>\\]+?\.mp4[^\"'\s<>\\]*",
     re.I,
 )
+_PINTEREST_HLS_RE = re.compile(
+    r"https?://[A-Za-z0-9.-]*pinimg\.com/videos/[^\"'\s<>\\]+?\.m3u8[^\"'\s<>\\]*",
+    re.I,
+)
 _PINTEREST_ORIGINAL_RE = re.compile(
     r"https?://i\.pinimg\.com/originals/[^\"'\s<>\\]+", re.I
 )
@@ -935,17 +939,220 @@ def _pinterest_original(image_url: str) -> str:
     return image_url
 
 
-def _pinterest_media(body: str) -> tuple[str, str] | None:
-    """Что в пине: ("video"|"image", прямой URL)."""
-    text = _pinterest_text(body)
+def _pinterest_main_window(text: str) -> str:
+    """Кусок Relay-ответа с данными самого пина (без чужих рекомендаций)."""
+    start = text.find('"v3GetPinQueryv2"')
+    if start == -1:
+        return text
+    return text[start : start + 40_000]
 
+
+def _pinterest_pin_data(body: str) -> dict | None:
+    """Данные самого пина из встроенного JSON Pinterest.
+
+    Страница кладёт ответ ``PinResource`` в
+    ``<script data-test-id="resource-response-data">``. Это точный тип пина и
+    его медиа — без соседних/похожих пинов, которые раньше подмешивались.
+    """
+    for match in re.finditer(
+        r'<script[^>]*data-test-id="resource-response-data"[^>]*>(.*?)</script>',
+        body,
+        re.S | re.I,
+    ):
+        try:
+            data = json.loads(match.group(1))
+        except Exception:  # noqa: BLE001 — битый/обрезанный JSON
+            continue
+        if not isinstance(data, dict):
+            continue
+        resource = data.get("resource") or {}
+        if resource.get("name") not in {"PinResource", "Pin", "PinResourceResponse"}:
+            continue
+        pin = (data.get("resource_response") or {}).get("data")
+        if isinstance(pin, dict) and (pin.get("id") or pin.get("entityId")):
+            return pin
+    return None
+
+
+def _pinterest_video_entries(pin: dict) -> list[tuple[str, int]]:
+    """Все видео пина: (url, длительность в мс). MP4 раньше HLS."""
+    entries: list[tuple[str, int]] = []
+
+    def collect(video_list) -> None:
+        if not isinstance(video_list, dict):
+            return
+        for variant in video_list.values():
+            if not isinstance(variant, dict):
+                continue
+            url = variant.get("url") or ""
+            if not isinstance(url, str) or not url.startswith("http"):
+                continue
+            duration = variant.get("duration") or 0
+            try:
+                duration = int(duration)
+            except (TypeError, ValueError):
+                duration = 0
+            entries.append((url, duration))
+
+    collect((pin.get("videos") or {}).get("video_list"))
+    for page in ((pin.get("story_pin_data") or {}).get("pages") or []):
+        if not isinstance(page, dict):
+            continue
+        collect((page.get("video") or {}).get("video_list"))
+        for block in page.get("blocks") or []:
+            if isinstance(block, dict):
+                collect((block.get("video") or {}).get("video_list"))
+        for block in page.get("media") or []:
+            if isinstance(block, dict):
+                collect((block.get("video") or {}).get("video_list"))
+
+    # MP4 — первыми, HLS — запасной вариант.
+    entries.sort(key=lambda item: (".mp4" not in item[0].lower(), item[0]))
+    return entries
+
+
+def _pinterest_video_signature(pin: dict) -> str:
+    for page in ((pin.get("story_pin_data") or {}).get("pages") or []):
+        if isinstance(page, dict) and page.get("video_signature"):
+            return str(page["video_signature"])
+    videos = pin.get("videos") or {}
+    signature = videos.get("video_signature")
+    return str(signature) if signature else ""
+
+
+def _pinterest_pin_title(pin: dict) -> str:
+    for key in ("description", "grid_title", "title", "closeup_unified_title"):
+        value = pin.get(key)
+        if isinstance(value, str):
+            value = " ".join(value.split())
+            if value:
+                return value[:200]
+    return ""
+
+
+def _pinterest_pin_image(pin: dict) -> str:
+    """Оригинал картинки пина (у карусели — первая картинка)."""
+    # У story-пинов настоящая картинка лежит в странице, а не в обложке.
+    for page in ((pin.get("story_pin_data") or {}).get("pages") or []):
+        if not isinstance(page, dict):
+            continue
+        images = ((page.get("image") or {}).get("images")) or {}
+        item = images.get("originals") or images.get("orig")
+        if isinstance(item, dict) and item.get("url"):
+            return str(item["url"])
+
+    images = pin.get("images") or {}
+    for key in ("orig", "originals", "1200x", "736x", "564x"):
+        item = images.get(key)
+        if isinstance(item, dict) and item.get("url"):
+            return str(item["url"])
+        if isinstance(item, str) and item.startswith("http"):
+            return item
+
+    slots = ((pin.get("carousel_data") or {}).get("carousel_slots")) or []
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        slot_images = slot.get("images") or {}
+        for key in ("orig", "originals", "1200x", "736x", "564x"):
+            item = slot_images.get(key)
+            if isinstance(item, dict) and item.get("url"):
+                return _pinterest_original(str(item["url"]))
+        video = _pinterest_video_entries(slot)
+        if video:
+            return ""
+
+    signature = pin.get("image_signature")
+    if signature:
+        return _pinterest_signature_url(str(signature), "originals", "jpg")
+    return ""
+
+
+def _pinterest_preload(body: str) -> str:
+    for tag in re.findall(r"<link\b[^>]*>", body, re.I):
+        if "pin-image-preload" not in tag.lower():
+            continue
+        href = re.search(r'\bhref\s*=\s*["\']([^"\']+)["\']', tag, re.I)
+        if href:
+            value = html.unescape(href.group(1)).strip()
+            return "https:" + value if value.startswith("//") else value
+    return ""
+
+
+def _pinterest_signature_url(signature: str, size: str, ext: str) -> str:
+    return (
+        f"https://i.pinimg.com/{size}/{signature[:2]}/{signature[2:4]}/"
+        f"{signature[4:6]}/{signature}.{ext}"
+    )
+
+
+def _pinterest_mp4_url(signature: str, variant: str = "720w") -> str:
+    """MP4-вариант видео по подписи: у Pinterest это тот же хеш, что и у картинок."""
+    return (
+        f"https://v1.pinimg.com/videos/iht/expMp4/{signature[:2]}/{signature[2:4]}/"
+        f"{signature[4:6]}/{signature}_{variant}.mp4"
+    )
+
+
+def _pinterest_media_candidates(body: str) -> list[tuple[str, str]]:
+    """Упорядоченные варианты медиа: сначала основное, потом запасные.
+
+    Pinterest отдаёт картинку в нескольких размерах, а видео — несколькими
+    mp4-вариантами и HLS. Если один URL отвечает 403, пробуем следующий.
+    """
+    text = _pinterest_text(body)
+    window = _pinterest_main_window(text)
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(kind: str, url: str) -> None:
+        value = html.unescape(url or "").strip()
+        if value.startswith("//"):
+            value = "https:" + value
+        if not value.startswith("http") or value in seen:
+            return
+        seen.add(value)
+        candidates.append((kind, value))
+
+    # 1) Встроенный JSON пина — самый точный источник: в нём только этот пин,
+    #    поэтому картинка не превращается в видео из соседней рекомендации.
+    pin = _pinterest_pin_data(body)
+    if pin is not None:
+        entries = _pinterest_video_entries(pin)
+        if entries:
+            for url, _ in entries:
+                if ".mp4" in url.lower():
+                    add("video", url)
+            signature = _pinterest_video_signature(pin)
+            if signature:
+                add("video", _pinterest_mp4_url(signature))
+            for url, _ in entries:
+                if ".mp4" not in url.lower():
+                    add("hls", url)
+            if candidates:
+                return candidates
+
+        image = _pinterest_pin_image(pin)
+        if image:
+            add("image", image)
+        preload = _pinterest_preload(body)
+        if preload:
+            add("image", preload)
+            add("image", _pinterest_original(preload))
+        if candidates:
+            return candidates
+
+    # 2) Страница без JSON: старый разбор по разметке.
     videos = []
-    for candidate in _PINTEREST_VIDEO_RE.findall(text):
+    hevc = []
+    for candidate in _PINTEREST_VIDEO_RE.findall(window):
         low = candidate.lower()
         if "hevc" in low or "h265" in low:
-            continue  # Telegram не всегда проигрывает HEVC
-        videos.append(candidate)
-    if videos:
+            hevc.append(candidate)
+        else:
+            videos.append(candidate)
+
+    if videos or hevc:
         def rank(item: str) -> int:
             low = item.lower()
             score = 0
@@ -961,33 +1168,53 @@ def _pinterest_media(body: str) -> tuple[str, str] | None:
                 score += 30
             return score
 
-        return "video", sorted(set(videos), key=rank)[0]
+        for item in sorted(set(videos), key=rank):
+            add("video", item)
+        for item in sorted(set(hevc), key=rank):
+            add("video", item)
+        for item in _PINTEREST_HLS_RE.findall(window):
+            add("hls", item)
+        return candidates
 
-    # 1) ссылка из preload — это именно картинка самого пина
-    for tag in re.findall(r"<link\b[^>]*>", body, re.I):
-        if "pin-image-preload" not in tag.lower():
-            continue
-        href = re.search(r'\bhref\s*=\s*["\']([^"\']+)["\']', tag, re.I)
-        if href:
-            return "image", _pinterest_original(html.unescape(href.group(1)))
+    # Основная картинка: imageSignature даёт точный хеш самого пина.
+    preload = _pinterest_preload(body)
+    ext_match = re.search(r"\.(jpe?g|png|webp|gif)(?:\?|$)", preload, re.I)
+    ext = ext_match.group(1).lower() if ext_match else "jpg"
+    if ext == "jpeg":
+        ext = "jpg"
+    sig_match = re.search(
+        r'"imageSignature"\s*:\s*"([0-9a-f]{16,})"', window, re.I
+    )
+    signature = sig_match.group(1) if sig_match else ""
+    if signature:
+        add("image", _pinterest_signature_url(signature, "originals", ext))
+    if preload:
+        add("image", preload)
+        add("image", _pinterest_original(preload))
 
-    # 2) обычные og/twitter-теги (бывают у части пинов)
     for key in ("og:image:secure_url", "og:image", "twitter:image"):
         value = _meta_value(body, key)
         if value:
-            if value.startswith("//"):
-                value = "https:" + value
-            if value.startswith("http"):
-                return "image", _pinterest_original(value)
+            add("image", _pinterest_original(value))
 
-    # 3) Relay-данные: первый originals обычно принадлежит самому пину
-    originals = _PINTEREST_ORIGINAL_RE.findall(text)
-    if originals:
-        return "image", originals[0]
-    images = _PINTEREST_IMAGE_RE.findall(text)
-    if images:
-        return "image", _pinterest_original(images[0])
-    return None
+    for item in _PINTEREST_ORIGINAL_RE.findall(window)[:3]:
+        add("image", item)
+    for item in _PINTEREST_IMAGE_RE.findall(window)[:5]:
+        add("image", _pinterest_original(item))
+
+    if not candidates:
+        # Последний шанс: страница без imageSignature/preload.
+        for item in _PINTEREST_ORIGINAL_RE.findall(text)[:5]:
+            add("image", item)
+        for item in _PINTEREST_IMAGE_RE.findall(text)[:5]:
+            add("image", _pinterest_original(item))
+    return candidates
+
+
+def _pinterest_media(body: str) -> tuple[str, str] | None:
+    """Первый вариант медиа — для тестов и диагностики."""
+    candidates = _pinterest_media_candidates(body)
+    return candidates[0] if candidates else None
 
 
 def _js_unescape(value: str) -> str:
@@ -1000,6 +1227,12 @@ def _js_unescape(value: str) -> str:
 def _pinterest_title(body: str, pin_id: str) -> str:
     def clean(value: str) -> str:
         return " ".join(value.split())[:200]
+
+    pin = _pinterest_pin_data(body)
+    if pin is not None:
+        value = _pinterest_pin_title(pin)
+        if value:
+            return clean(value)
 
     for key in ("og:title", "twitter:title"):
         value = _meta_value(body, key)
@@ -1041,9 +1274,18 @@ def _pinterest_download_direct(
 ) -> int:
     request = urllib.request.Request(
         media_url,
-        headers={**_PINTEREST_HEADERS, "Referer": referer, "Accept": "*/*"},
+        headers={
+            **_PINTEREST_HEADERS,
+            "Referer": referer,
+            "Origin": "https://www.pinterest.com",
+            "Accept": "*/*",
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "same-site",
+        },
     )
-    with urllib.request.urlopen(request, timeout=120) as response:
+    opener = _pinterest_opener()
+    with opener.open(request, timeout=120) as response:
         total = response.headers.get("Content-Length")
         total = int(total) if total and total.isdigit() else None
         done = 0
@@ -1083,6 +1325,7 @@ def _pinterest_curl_download(
         "--silent",
         "--show-error",
         "--location",
+        "--compressed",
         "--max-time",
         "300",
         "--proxy",
@@ -1091,10 +1334,14 @@ def _pinterest_curl_download(
         _PINTEREST_HEADERS["User-Agent"],
         "--referer",
         referer,
+        "--header",
+        "Origin: https://www.pinterest.com",
         "--output",
         str(dest),
         media_url,
     ]
+    if COOKIES_FILE and Path(COOKIES_FILE).exists():
+        cmd[1:1] = ["--cookie", str(COOKIES_FILE)]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except OSError as exc:
@@ -1136,6 +1383,18 @@ def _pinterest_download_file(
         raise
     except urllib.error.HTTPError as exc:
         dest.unlink(missing_ok=True)
+        proxy = _yt_proxy()
+        # 403 бывает и «не тому региону/адресу»: пробуем через WARP, если он есть.
+        if proxy and exc.code in {403, 429, 451}:
+            log.warning("Pinterest: HTTP %s, пробую WARP", exc.code)
+            try:
+                return _pinterest_curl_download(
+                    media_url, dest, referer, proxy, on_progress, cancel
+                )
+            except DownloadCancelled:
+                raise
+            except DownloadError as warp_exc:
+                log.warning("Pinterest: через WARP тоже не вышло (%s)", warp_exc)
         raise DownloadError(
             f"Pinterest: файл не скачался (HTTP {exc.code})."
         ) from exc
@@ -1150,6 +1409,55 @@ def _pinterest_download_file(
         return _pinterest_curl_download(
             media_url, dest, referer, proxy, on_progress, cancel
         )
+
+
+def _pinterest_hls_download(
+    media_url: str,
+    out_dir: Path,
+    referer: str,
+    on_progress=None,
+    cancel=None,
+) -> tuple[Path, int]:
+    """HLS-вариант: yt-dlp сам соберёт сегменты в mp4 (нужен ffmpeg)."""
+    opts = _opts() | {
+        "noplaylist": True,
+        "outtmpl": str(out_dir / "pinterest-hls.%(ext)s"),
+        "format": "bv*+ba/b",
+        "merge_output_format": "mp4",
+        "progress_hooks": _progress_hook(on_progress, None, cancel),
+        "http_headers": {
+            **_PINTEREST_HEADERS,
+            "Referer": referer,
+            "Origin": "https://www.pinterest.com",
+        },
+        "overwrites": True,
+    }
+    try:
+        _extract_with_rescue(media_url, opts, download=True, cancel=cancel)
+    except DownloadCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        for leftover in out_dir.glob("pinterest-hls.*"):
+            leftover.unlink(missing_ok=True)
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled() from exc
+        raise DownloadError(
+            f"Pinterest: HLS не скачался ({str(exc)[:160]})."
+        ) from exc
+
+    produced = [
+        p
+        for p in out_dir.glob("pinterest-hls.*")
+        if p.is_file() and not p.name.endswith((".part", ".ytdl"))
+    ]
+    if not produced:
+        raise DownloadError("Pinterest: HLS не дал файл.")
+    src = max(produced, key=lambda p: p.stat().st_size)
+    dest = out_dir / "pinterest.mp4"
+    if src != dest:
+        dest.unlink(missing_ok=True)
+        src.replace(dest)
+    return dest, dest.stat().st_size
 
 
 def _extract_mp3(src: Path, dest: Path) -> bool:
@@ -1198,14 +1506,20 @@ def _pinterest_download_sync(
     pin_id = pin_match.group(1) if pin_match else ""
 
     body = _pinterest_page(canonical)
-    media = _pinterest_media(body)
-    if not media:
+    candidates = _pinterest_media_candidates(body)
+    if not candidates:
         raise DownloadError(
             "Pinterest: на странице пина не нашлось ни видео, ни картинки. "
             "Возможно, это текстовый пин или страница не догрузилась."
         )
 
-    kind, media_url = media
+    primary_kind = candidates[0][0]
+    if primary_kind == "image" and mode == "audio":
+        raise DownloadError(
+            "Pinterest: в этом пине картинка, звуковой дорожки нет. "
+            "Выберите «Фото-видео» — пришлю изображение."
+        )
+
     info = {
         "id": pin_id,
         "title": _pinterest_title(body, pin_id),
@@ -1213,52 +1527,93 @@ def _pinterest_download_sync(
         "duration": 0,
         "webpage_url": canonical,
     }
-
-    if kind == "image":
-        if mode == "audio":
-            raise DownloadError(
-                "Pinterest: в этом пине картинка, звуковой дорожки нет. "
-                "Выберите «Фото-видео» — пришлю изображение."
-            )
-        ext = _guess_ext(media_url)
-        if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
-            ext = ".jpg"
-        if ext == ".jpeg":
-            ext = ".jpg"
-        path = out_dir / f"pinterest{ext}"
-        size = _pinterest_download_file(
-            media_url, path, canonical, on_progress, cancel
+    pin = _pinterest_pin_data(body)
+    if pin is not None:
+        info["duration"] = max(
+            (ms // 1000 for _, ms in _pinterest_video_entries(pin)), default=0
         )
-        if size < 1024:
-            raise DownloadError("Pinterest: картинка пришла пустой.")
-        log.info("Pinterest: картинка %s (%s байт)", media_url, size)
+
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    last_error: DownloadError | None = None
+
+    for kind, media_url in candidates:
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled()
+
+        try:
+            if kind == "hls":
+                path, size = _pinterest_hls_download(
+                    media_url, out_dir, canonical, on_progress, cancel
+                )
+            else:
+                if kind == "image":
+                    ext = _guess_ext(media_url)
+                    if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                        ext = ".jpg"
+                    if ext == ".jpeg":
+                        ext = ".jpg"
+                    path = out_dir / f"pinterest{ext}"
+                else:
+                    path = out_dir / "pinterest.mp4"
+                size = _pinterest_download_file(
+                    media_url, path, canonical, on_progress, cancel
+                )
+                if kind == "image" and size < 1024:
+                    path.unlink(missing_ok=True)
+                    raise DownloadError("Pinterest: картинка пришла пустой.")
+                if kind == "video" and size < 10_000:
+                    path.unlink(missing_ok=True)
+                    raise DownloadError("Pinterest: видео пришло пустым.")
+        except DownloadCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 — пробуем следующий вариант
+            if cancel is not None and cancel.is_set():
+                raise DownloadCancelled() from exc
+            last_error = (
+                exc
+                if isinstance(exc, DownloadError)
+                else DownloadError(
+                    f"Pinterest: файл не скачался ({str(exc)[:120]})."
+                )
+            )
+            log.warning(
+                "Pinterest: вариант %s не подошёл (%s)", media_url, last_error
+            )
+            continue
+
+        if kind == "image":
+            log.info("Pinterest: картинка %s (%s байт)", media_url, size)
+            return path, info
+
+        if mode == "audio":
+            audio = out_dir / "pinterest.mp3"
+            if not _extract_mp3(path, audio):
+                path.unlink(missing_ok=True)
+                audio.unlink(missing_ok=True)
+                raise DownloadError(
+                    "Pinterest: не удалось извлечь звук (нужен ffmpeg). "
+                    "Выберите «Фото-видео» — пришлю видео."
+                )
+            path.unlink(missing_ok=True)
+            log.info("Pinterest: звук из видео %s", media_url)
+            return audio, info
+
+        if size > max_bytes:
+            # Этот вариант слишком большой — пробуем качество пониже.
+            path.unlink(missing_ok=True)
+            last_error = DownloadError(
+                f"Pinterest: видео больше {MAX_UPLOAD_MB} МБ — Telegram не "
+                "примет. Выберите «Только звук»."
+            )
+            log.warning("Pinterest: %s, пробую вариант поменьше", last_error)
+            continue
+
+        log.info("Pinterest: видео %s (%s байт)", media_url, size)
         return path, info
 
-    video = out_dir / "pinterest.mp4"
-    size = _pinterest_download_file(media_url, video, canonical, on_progress, cancel)
-    if size < 10_000:
-        raise DownloadError("Pinterest: видео пришло пустым.")
-
-    if mode == "audio":
-        audio = out_dir / "pinterest.mp3"
-        if not _extract_mp3(video, audio):
-            video.unlink(missing_ok=True)
-            raise DownloadError(
-                "Pinterest: не удалось извлечь звук (нужен ffmpeg). "
-                "Выберите «Фото-видео» — пришлю видео."
-            )
-        video.unlink(missing_ok=True)
-        log.info("Pinterest: звук из видео %s", media_url)
-        return audio, info
-
-    if video.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
-        video.unlink(missing_ok=True)
-        raise DownloadError(
-            f"Pinterest: видео больше {MAX_UPLOAD_MB} МБ — Telegram не примет. "
-            "Выберите «Только звук»."
-        )
-    log.info("Pinterest: видео %s (%s байт)", media_url, size)
-    return video, info
+    raise last_error or DownloadError(
+        "Pinterest: не удалось скачать файл со страницы пина."
+    )
 
 
 def _dns_retry(func, attempts: int = 3, delay: float = 1.5):

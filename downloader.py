@@ -36,6 +36,7 @@ from config import (
     MAX_UPLOAD_MB,
     POT_SERVER,
     PROXY,
+    VK_COOKIE,
     YT_PLAYER_CLIENT,
     YT_PROXY,
     writable_cookie_copy,
@@ -295,6 +296,7 @@ _SERVICES = {
     "vkvideo.ru": "VK",
     "vk.cc": "VK",
     "vk.link": "VK",
+    "userapi.com": "VK",
     "reddit.com": "Reddit",
     "redd.it": "Reddit",
     "vimeo.com": "Vimeo",
@@ -367,6 +369,12 @@ def _is_vk(url: str) -> bool:
     )
 
 
+def _is_vk_cdn(url: str) -> bool:
+    """Прямая ссылка на картинку VK (sun9-…userapi.com/…jpg)."""
+    host = (urlsplit(url).netloc or "").lower()
+    return host == "userapi.com" or host.endswith(".userapi.com")
+
+
 def _vk_url(url: str) -> str:
     """VK переехал на vk.ru, но yt-dlp посты на стене понимает только на vk.com.
 
@@ -388,9 +396,142 @@ def _vk_url(url: str) -> str:
 
 
 VK_META_UA = "TelegramBot (like TwitterBot)"
+VK_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+)
 # заглушка VK для постов без вложения: 1920x1010 «Пост из ленты ВКонтакте»
 VK_STUB_IMAGE = "fafvjSB8ha2EWPn-VR6LIahBtBkf50LZSLbKfQ/BiN2pjgeJTw.png"
 _VK_VIDEO_PATH_RE = re.compile(r"/(?:video|clip)-?\d", re.I)
+_VK_PHOTO_PATH_RE = re.compile(r"/photo(-?\d+)_(\d+)", re.I)
+_VK_PHOTO_LOCKED = (
+    "VK: это фото из закрытого или 18+ сообщества.\n"
+    "Анонимно VK отдаёт такие фото только после входа. Добавьте VK-куки "
+    "в VK_COOKIE (или vk.com-куки в COOKIES_FILE) и пришлите ссылку снова."
+)
+
+
+def _vk_cookie_header() -> str:
+    """Cookie для vk.com: из VK_COOKIE или из общего COOKIES_FILE.
+
+    VK показывает фото закрытых и 18+ сообществ только вошедшим, поэтому
+    без этой строки остаётся лишь честно сказать «нужен вход».
+    """
+    if VK_COOKIE:
+        parts = [part.strip() for part in re.split(r"[;\n\r]+", VK_COOKIE) if part.strip()]
+        return "; ".join(parts)
+    if not COOKIES_FILE:
+        return ""
+    try:
+        jar = http.cookiejar.MozillaCookieJar(str(COOKIES_FILE))
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except Exception as exc:  # noqa: BLE001 — без кук VK просто не пустит
+        log.debug("VK: cookies не прочитались: %s", exc)
+        return ""
+
+    pairs: dict[str, str] = {}
+    for cookie in jar:
+        domain = (cookie.domain or "").lstrip(".").lower()
+        if domain in {"vk.com", "vk.ru"} or domain.endswith((".vk.com", ".vk.ru")):
+            pairs[cookie.name] = cookie.value
+    return "; ".join(f"{name}={value}" for name, value in pairs.items())
+
+
+def _vk_photo_ref(url: str) -> tuple[int, int] | None:
+    """Владелец и id фото из ссылки /photo-123_456 или photo.php?oid=…&id=…."""
+    parts = urlsplit(url)
+    match = _VK_PHOTO_PATH_RE.search(parts.path)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    if parts.path.rstrip("/").lower().endswith("photo.php"):
+        query = urllib.parse.parse_qs(parts.query)
+        owner = (query.get("oid") or [""])[0]
+        photo = (query.get("id") or [""])[0]
+        if owner.lstrip("-").isdigit() and photo.isdigit():
+            return int(owner), int(photo)
+    return None
+
+
+def _vk_al_photo_media(url: str, cookie: str | None = None) -> str | None:
+    """Прямой URL фото через внутренний al_photos.php (нужны cookies входа).
+
+    VK отдаёт фото закрытого сообщества только авторизованному клиенту;
+    без кук в ответе будет «Ошибка доступа», и функция вернёт None.
+    """
+    ref = _vk_photo_ref(url)
+    cookie = cookie or _vk_cookie_header()
+    if not ref or not cookie:
+        return None
+    owner, photo_id = ref
+    gid = str(abs(owner)) if owner < 0 else "0"
+
+    # VK в разных контекстах ждёт либо полный id фото, либо только pid + gid.
+    variants: list[dict[str, str]] = []
+    for photo, group in (
+        (f"{owner}_{photo_id}", gid),
+        (str(photo_id), gid),
+        (f"{owner}_{photo_id}", "0"),
+    ):
+        variant = {"photo": photo, "gid": group}
+        if variant not in variants:
+            variants.append(variant)
+
+    for variant in variants:
+        payload = urllib.parse.urlencode(
+            {
+                "act": "show",
+                "al": "1",
+                "gid": variant["gid"],
+                "photo": variant["photo"],
+                "list": "",
+                "dmcah": "",
+                "module": "public",
+                "list_info": "",
+            }
+        ).encode()
+        request = urllib.request.Request(
+            "https://vk.com/al_photos.php",
+            data=payload,
+            headers={
+                "User-Agent": VK_BROWSER_UA,
+                "Accept": "*/*",
+                "Accept-Language": "ru-RU,ru;q=0.9",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": url,
+                "Origin": "https://vk.com",
+                "Cookie": cookie,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read()
+        except Exception as exc:  # noqa: BLE001 — фото могло быть удалено
+            log.debug("VK: al_photos не ответил (%s): %s", variant, exc)
+            continue
+
+        body = raw.decode("cp1251", "replace")
+        body = body.replace("\\/", "/")
+        body = re.sub(r"\\u002[fF]", "/", body)
+        body = re.sub(r"\\u002[6bB]", "&", body)
+        candidates: list[str] = []
+        for found in re.findall(
+            r"https?://[^\"'\s<>\\]+?\.(?:jpe?g|png|webp)(?:\?[^\"'\s<>\\]*)?",
+            body,
+            re.I,
+        ):
+            if "userapi.com" not in found:
+                continue
+            found = html.unescape(found)
+            if found not in candidates:
+                candidates.append(found)
+        if candidates:
+            originals = [item for item in candidates if "/impf/" in item]
+            return (originals or candidates)[-1]
+    return None
+
+
 
 
 def _meta_value(body: str, key: str) -> str:
@@ -413,14 +554,15 @@ def _vk_og_media(url: str) -> tuple[str, str] | None:
     badbrowser.php), зато боту предпросмотра отдаёт готовые og:image/og:video.
     Так разбираются ссылки на фото и посты, которые yt-dlp не понимает.
     """
+    cookie = _vk_cookie_header()
+    headers = {
+        "User-Agent": VK_BROWSER_UA if cookie else VK_META_UA,
+        "Accept-Language": "ru-RU,ru;q=0.9",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
     try:
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": VK_META_UA,
-                "Accept-Language": "ru-RU,ru;q=0.9",
-            },
-        )
+        request = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(request, timeout=20) as response:
             body = response.read().decode("utf-8", "replace")
     except Exception as exc:  # noqa: BLE001
@@ -443,16 +585,25 @@ def _vk_og_media(url: str) -> tuple[str, str] | None:
     image = _meta_value(body, "og:image:secure_url") or _meta_value(body, "og:image")
     if image.startswith("//"):
         image = "https:" + image
-    if not image.startswith("http"):
-        return None
-    if _VK_VIDEO_PATH_RE.search(urlsplit(url).path):
-        return None  # у страницы видео фото-вложения нет
-    if VK_STUB_IMAGE in image:
-        return None  # заглушка «Пост из ленты ВКонтакте», а не вложение
-    if not _meta_value(body, "og:url"):
-        # у постов без вложения VK отдаёт только title/description/заглушку
-        return None
-    return "photo", image
+    if image.startswith("http"):
+        if _VK_VIDEO_PATH_RE.search(urlsplit(url).path):
+            image = ""  # у страницы видео фото-вложения нет
+        elif VK_STUB_IMAGE in image:
+            image = ""  # заглушка «Пост из ленты ВКонтакте», а не вложение
+        elif not _meta_value(body, "og:url"):
+            # у постов без вложения VK отдаёт только title/description/заглушку
+            image = ""
+        else:
+            return "photo", image
+
+    # Фото закрытого/18+ сообщества: OG-тегов нет, но с cookies входа
+    # внутренний al_photos.php отдаёт прямую ссылку на файл.
+    if _vk_photo_ref(url) and cookie:
+        direct = _vk_al_photo_media(url, cookie)
+        if direct:
+            return "photo", direct
+    return None
+
 
 
 def _vk_download_direct(kind: str, media_url: str, out_dir: Path) -> tuple[Path, dict]:
@@ -1648,6 +1799,10 @@ def friendly_error(exc: Exception, url: str | None = None) -> str:
     low = str(exc).lower()
     prefix = f"{service_name(url)}: " if url else ""
 
+    # Готовое объяснение по фото VK не должно перебиваться общей веткой про login.
+    if str(exc).startswith("VK: это фото"):
+        return str(exc)
+
     if "requested format is not available" in low:
         if url and is_youtube(url):
             return (
@@ -1688,7 +1843,8 @@ def friendly_error(exc: Exception, url: str | None = None) -> str:
         if url and _is_vk(url):
             return (
                 "VK: не понял ссылку.\n"
-                "Пришлите ссылку на видео (vk.com/video…), клип или пост, где есть видео."
+                "Пришлите ссылку на видео (vk.com/video…), клип, фото или пост. "
+                "Фото из закрытых и 18+ сообществ VK отдаёт только после входа."
             )
         return f"{prefix}этот сервис не поддерживается."
     if "geo" in low and "block" in low:
@@ -4740,6 +4896,13 @@ def _download_media_sync(
 
     url = _public_url(url)
 
+    # Прямая ссылка на картинку VK (её даёт «Открыть изображение в новой
+    # вкладке» даже для закрытых сообществ): качаем без страницы и без yt-dlp.
+    if _is_vk_cdn(url):
+        ext = Path(urlsplit(url).path).suffix.lower()
+        if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            return _vk_download_direct("photo", url, out_dir)
+
     # Reddit: свой путь через публичный Atom-фид (JSON и yt-dlp требуют вход).
     reddit_error: DownloadError | None = None
     if _is_reddit(url):
@@ -4818,6 +4981,8 @@ def _download_media_sync(
         # OG-тегов, которые VK отдаёт боту предпросмотра
         og = _vk_og_media(url) if _is_vk(url) else None
         if not og:
+            if _is_vk(url) and _vk_photo_ref(url):
+                raise DownloadError(_VK_PHOTO_LOCKED) from exc
             raise
         kind, media = og
         if kind == "embed":

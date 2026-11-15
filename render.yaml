@@ -14,5 +14,9 @@ services:
         sync: false
       - key: MAX_UPLOAD_MB
         value: "49"
+      - key: COBALT_SERVICES
+        value: all
+      - key: VK_COOKIE
+        sync: false
       - key: WEBHOOK_SECRET
         generateValue: true

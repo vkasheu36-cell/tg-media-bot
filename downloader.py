@@ -4294,11 +4294,24 @@ def _fa_login(force: bool = False) -> tuple[bool, str]:
 
 
 def _fa_page_meta(body: str) -> tuple[str, str, str] | None:
-    """Разбор страницы submission; None — это не она (челлендж Cloudflare)."""
+    """Разбор страницы submission; None — это не она (челлендж Cloudflare).
+
+    Раньше требовали «fur affinity» в первых 30 КБ. На новых страницах FA
+    заголовок уезжает дальше (большие inline-скрипты темы), и настоящая
+    работа считалась «не открылась» — хотя /fa_debug ту же страницу видел.
+    Теперь проверяем весь документ и признаки submission.
+    """
     head = body[:4000].lower()
-    if "just a moment" in head or "attention required" in head:
+    if (
+        "just a moment" in head
+        or "attention required" in head
+        or "cf-chl" in head
+    ):
         return None
-    if "fur affinity" not in body[:30000].lower():
+    low = body.lower()
+    if "fur affinity" not in low and "furaffinity" not in low:
+        return None
+    if "submission" not in low and "og:image" not in low:
         return None
     title, author = _fa_title_author(body)
     return _fa_page_image(body), title, author

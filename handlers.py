@@ -52,6 +52,7 @@ from downloader import (
     resolve_music_link_detailed,
     search,
     service_name,
+    vk_diagnose,
     yt_diagnose,
 )
 
@@ -112,7 +113,9 @@ HELP_TEXT = (
     "и ссылка на источник\n"
     "• <code>/ping</code> — жив ли бот и доходят ли сообщения\n"
     "• <code>/id</code> — ваш Telegram ID (для приватного режима)\n"
-    "• <code>/yt_debug https://youtu.be/...</code> — почему YouTube не качается\n\n"
+    "• <code>/yt_debug https://youtu.be/...</code> — почему YouTube не качается\n"
+    "• <code>/vk_debug https://vk.com/wall-...</code> — принял ли VK куки "
+    "и видит ли фото в посте\n\n"
     "YouTube качается напрямую (yt-dlp + cookies из COOKIES_FILE). VK и X —\n"
     "своим путём (без cobalt). Остальные сервисы сначала идут через cobalt, а\n"
     "если он не справился — через yt-dlp.\n"
@@ -767,6 +770,33 @@ async def cmd_fa_debug(message: Message) -> None:
         await message.answer(body)
     for chunk in chunks[1:]:
         await message.answer(f"<pre>{chunk}</pre>")
+
+
+@router.message(Command("vk_debug"))
+async def cmd_vk_debug(message: Message) -> None:
+    """Диагностика VK: приняты ли куки и что отдаёт страница поста."""
+    parts = (message.text or "").split(maxsplit=1)
+    url = parts[1].strip() if len(parts) > 1 else ""
+    if not url or not is_vk(url):
+        await message.answer(
+            "Пришлите ссылку VK:\n"
+            "<code>/vk_debug https://vk.com/wall-201163359_12398</code>"
+        )
+        return
+    status = await message.answer("🔎 Проверяю VK: куки и страницу поста…")
+    try:
+        report = await asyncio.wait_for(
+            asyncio.to_thread(vk_diagnose, url), timeout=150
+        )
+    except asyncio.TimeoutError:
+        report = "Не успел: VK отвечал дольше 150 секунд."
+    except Exception as exc:  # noqa: BLE001
+        report = f"{type(exc).__name__}: {exc}"
+    body = f"<pre>{html.escape(report)[:3900]}</pre>"
+    try:
+        await status.edit_text(body)
+    except Exception:  # noqa: BLE001 — сообщение могли удалить
+        await message.answer(body)
 
 
 @router.message(Command("yt_debug"))

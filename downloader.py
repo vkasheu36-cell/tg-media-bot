@@ -417,15 +417,8 @@ _VK_PHOTO_LOCKED = (
 )
 
 
-def _vk_cookie_header() -> str:
-    """Cookie для vk.com: из VK_COOKIE или из общего COOKIES_FILE.
-
-    VK показывает фото закрытых и 18+ сообществ только вошедшим, поэтому
-    без этой строки остаётся лишь честно сказать «нужен вход».
-    """
-    if VK_COOKIE:
-        parts = [part.strip() for part in re.split(r"[;\n\r]+", VK_COOKIE) if part.strip()]
-        return "; ".join(parts)
+def _vk_file_cookie_header() -> str:
+    """vk.com-куки из общего COOKIES_FILE (Render Secret File)."""
     if not COOKIES_FILE:
         return ""
     try:
@@ -441,6 +434,34 @@ def _vk_cookie_header() -> str:
         if domain in {"vk.com", "vk.ru"} or domain.endswith((".vk.com", ".vk.ru")):
             pairs[cookie.name] = cookie.value
     return "; ".join(f"{name}={value}" for name, value in pairs.items())
+
+
+def _vk_cookie_header() -> str:
+    """Cookie для vk.com: из VK_COOKIE или из общего COOKIES_FILE.
+
+    VK показывает фото закрытых и 18+ сообществ только вошедшим, поэтому
+    без этой строки остаётся лишь честно сказать «нужен вход».
+    """
+    if VK_COOKIE:
+        parts = [part.strip() for part in re.split(r"[;\n\r]+", VK_COOKIE) if part.strip()]
+        return "; ".join(parts)
+    return _vk_file_cookie_header()
+
+
+def _vk_cookie_variants() -> list[str]:
+    """Все доступные наборы vk-кук: VK_COOKIE, затем vk.com-куки из COOKIES_FILE.
+
+    Если VK_COOKIE устарел, иногда в общем cookies-файле лежит более свежая
+    сессия — тогда пост всё равно откроется.
+    """
+    variants: list[str] = []
+    primary = _vk_cookie_header()
+    if primary:
+        variants.append(primary)
+    file_cookie = _vk_file_cookie_header()
+    if file_cookie and file_cookie not in variants:
+        variants.append(file_cookie)
+    return variants
 
 
 def _vk_photo_ref(url: str) -> tuple[int, int] | None:
@@ -578,7 +599,7 @@ def _vk_og_media(url: str) -> tuple[str, str] | None:
         try:
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=20) as response:
-                candidate = response.read().decode("utf-8", "replace")
+                candidate = _vk_decode(response.read())
         except Exception as exc:  # noqa: BLE001
             log.debug("VK: OG-страница не открылась: %s", exc)
             continue
@@ -646,15 +667,33 @@ def _vk_download_direct(kind: str, media_url: str, out_dir: Path) -> tuple[Path,
 
 VK_PHOTO_LIMIT = 20
 VK_WALL_RE = re.compile(r"/wall(-?\d+)_(\d+)", re.I)
+VK_CHARSET_RE = re.compile(rb"charset=[\"']?([\w-]+)", re.I)
 VK_PAGE_LOCKED = (
-    "VK не отдал пост: сообщество закрытое или пост скрыт от гостей.\n"
-    "Добавьте свежие vk.com-куки в VK_COOKIE на Render (минимум remixsid) "
-    "и пришлите ссылку снова."
+    "VK не отдал пост: сообщество закрытое или пост скрыт.\n"
+    "Если VK_COOKIE уже задан, VK его не принял: сессия устарела или куки\n"
+    "скопированы не целиком. Скопируйте Cookie из запроса к vk.com полностью\n"
+    "(remixsid + remixnsid… + remixlang) и проверьте через /vk_debug <ссылка>."
 )
 
 
-def _vk_page(url: str, user_agent: str, cookie: str = "", timeout: int = 20) -> str | None:
-    """HTML страницы VK или None, если VK ответил ошибкой."""
+def _vk_decode(raw: bytes) -> str:
+    """VK отдаёт старые страницы в windows-1251, новые — в utf-8."""
+    charset = "windows-1251"
+    match = VK_CHARSET_RE.search(raw[:4096])
+    if match:
+        name = match.group(1).decode("ascii", "ignore").lower()
+        if name in {"utf-8", "utf8"}:
+            charset = "utf-8"
+    try:
+        return raw.decode(charset, "replace")
+    except LookupError:
+        return raw.decode("utf-8", "replace")
+
+
+def _vk_fetch(
+    url: str, user_agent: str, cookie: str = "", timeout: int = 20
+) -> tuple[str, str] | None:
+    """(итоговый URL, HTML) — итоговый URL нужен, чтобы увидеть редирект на логин."""
     headers = {
         "User-Agent": user_agent,
         # VK отдаёт полный HTML с вложениями только при Accept: */* (или без
@@ -668,10 +707,31 @@ def _vk_page(url: str, user_agent: str, cookie: str = "", timeout: int = 20) -> 
     try:
         request = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read().decode("utf-8", "replace")
+            return response.geturl(), _vk_decode(response.read())
+    except urllib.error.HTTPError as exc:
+        # 302 на login.vk.com urllib считает ошибкой (цикл редиректов).
+        # Возвращаем адрес редиректа: по нему видно, что сессия не принята.
+        try:
+            location = exc.headers.get("Location") or ""
+        except Exception:  # noqa: BLE001
+            location = ""
+        if location.startswith("/"):
+            location = "https://vk.com" + location
+        try:
+            body = _vk_decode(exc.read() or b"")
+        except Exception:  # noqa: BLE001
+            body = ""
+        return (location or exc.geturl() or url), body
     except Exception as exc:  # noqa: BLE001 — 404 у закрытой стены это норма
         log.debug("VK: страница не открылась (%s): %s", user_agent[:24], exc)
         return None
+
+
+def _vk_page(url: str, user_agent: str, cookie: str = "", timeout: int = 20) -> str | None:
+    """HTML страницы VK или None, если VK ответил ошибкой."""
+    result = _vk_fetch(url, user_agent, cookie, timeout)
+    return result[1] if result else None
+
 
 
 def _vk_json_arrays(text: str, key: str) -> list[list]:
@@ -744,12 +804,12 @@ def vk_wall_media_sync(
     # могут попасть чужие рекомендации.
     if not VK_WALL_RE.search(urlsplit(url).path):
         return None
-    cookie = _vk_cookie_header()
+    cookies = _vk_cookie_variants()
     attempts: list[tuple[str, str]] = []
-    if cookie:
-        attempts.append((VK_BROWSER_UA, cookie))
+    for jar in cookies:
+        attempts.append((VK_BROWSER_UA, jar))
     attempts.append((VK_META_UA, ""))
-    if not cookie:
+    if not cookies:
         attempts.append((VK_BROWSER_UA, ""))
 
     photos: list[str] = []
@@ -816,6 +876,114 @@ async def download_vk(
         url, out_dir, on_progress=on_progress, cancel=cancel
     )
     return [path], info
+
+
+def _vk_login_redirect(final_url: str) -> bool:
+    """VK отправил на страницу входа — значит, сессию не принял."""
+    parts = urlsplit(final_url)
+    low = (parts.path or "").lower() + "?" + (parts.query or "").lower()
+    return "login" in low or "act=slogin" in low
+
+
+def _vk_session_text(feed: tuple[str, str] | None) -> str:
+    if not feed:
+        return "нет ответа от vk.com (сеть/блокировка)"
+    final, body = feed
+    if _vk_login_redirect(final) or len(body) < 200:
+        path = urlsplit(final).path or "/"
+        return f"НЕ принял куки → {path}"
+    return "принял куки"
+
+
+def vk_diagnose(url: str) -> str:
+    """Отчёт для /vk_debug: приняты ли куки и что отдаёт страница поста."""
+    normalized = _vk_url(url)
+    variants = _vk_cookie_variants()
+    primary = variants[0] if variants else ""
+    file_cookie = _vk_file_cookie_header()
+    names = re.findall(r"([\w.-]+)=", primary)
+    remixsid = next(
+        (
+            part.partition("=")[2].strip()
+            for part in primary.split(";")
+            if part.strip().startswith("remixsid=")
+        ),
+        "",
+    )
+    nsid = [name for name in names if name.startswith("remixnsid")]
+
+    lines = [
+        "VK-диагностика",
+        f"ссылка: {normalized}",
+        f"VK_COOKIE: {'задан' if VK_COOKIE else 'нет'}; "
+        f"vk-куки в COOKIES_FILE: {'есть' if file_cookie else 'нет'}",
+    ]
+    if primary:
+        lines.append(
+            f"куки: {len(names)} шт." + (f" ({', '.join(names[:10])})" if names else "")
+        )
+        lines.append(
+            f"remixsid: {len(remixsid)} символов; remixlang: "
+            f"{'да' if 'remixlang' in names else 'нет'}; "
+            f"remixnsid*: {', '.join(nsid) if nsid else 'нет'}"
+        )
+    else:
+        lines.append("куки: нет — закрытые сообщества недоступны")
+
+    for index, jar in enumerate(variants, start=1):
+        label = "VK_COOKIE" if index == 1 and VK_COOKIE else f"набор #{index}"
+        feed = _vk_fetch("https://vk.com/feed", VK_BROWSER_UA, jar, timeout=15)
+        lines.append(f"сессия {label}: {_vk_session_text(feed)}")
+
+    attempts: list[tuple[str, str]] = [
+        (f"куки #{index}", jar) for index, jar in enumerate(variants, start=1)
+    ]
+    attempts.append(("бот без кук", ""))
+    if not variants:
+        attempts.append(("браузер без кук", ""))
+
+    lines.append("попытки:")
+    best_photos: list[str] = []
+    is_wall = bool(VK_WALL_RE.search(urlsplit(normalized).path))
+    for label, jar in attempts:
+        user_agent = VK_META_UA if "бот" in label else VK_BROWSER_UA
+        result = _vk_fetch(normalized, user_agent, jar, timeout=20)
+        if not result:
+            lines.append(f"  {label}: нет ответа")
+            continue
+        final, body = result
+        photos = _vk_page_photos(body)[0] if is_wall else []
+        marker = ""
+        if _vk_login_redirect(final):
+            marker = " — VK отправил на login"
+        else:
+            for text in (
+                "Вы не можете просматривать стену",
+                "Стена не найдена",
+                "Ошибка",
+            ):
+                if text.lower() in body.lower():
+                    marker = f" — «{text}»"
+                    break
+        parts = urlsplit(final)
+        lines.append(
+            f"  {label}: {parts.netloc}{parts.path}, {len(body)} байт, "
+            f"фото: {len(photos)}{marker}"
+        )
+        if photos and not best_photos:
+            best_photos = photos
+
+    if best_photos:
+        lines.append(f"итог: можно скачать {len(best_photos)} фото")
+    elif not variants:
+        lines.append("итог: фото нет; для закрытых сообществ нужен VK_COOKIE")
+    else:
+        lines.append(
+            "итог: фото нет. Если сессия «НЕ принял куки» — скопируйте Cookie "
+            "из запроса к vk.com целиком; если «принял», но фото 0 — аккаунт "
+            "не видит стену (нет подписки/возраст)."
+        )
+    return "\n".join(lines)
 
 
 def is_vk(url: str) -> bool:

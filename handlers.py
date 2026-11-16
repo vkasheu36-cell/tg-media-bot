@@ -42,9 +42,11 @@ from downloader import (
     cobalt_services_report,
     download_audio,
     download_media,
+    download_vk,
     download_x,
     fa_diagnose,
     is_music_link,
+    is_vk,
     is_x,
     is_youtube,
     resolve_music_link_detailed,
@@ -79,8 +81,8 @@ START_TEXT = (
     "📥 <b>Медиа по ссылке</b> — кинь ссылку на YouTube, TikTok, VK, Twitter/X, "
     "Instagram, Reddit, Rutube, Vimeo, SoundCloud, Pinterest, FurAffinity и "
     "многое другое — пришлю файл.\n\n"
-    "🖼 <b>Посты X с фото</b> — до 20 картинок: можно склеить их в одну "
-    "ленту без промежутков или скачать все.\n\n"
+    "🖼 <b>Посты X и VK с фото</b> — X: до 20 картинок, можно склеить их "
+    "в одну ленту; VK: все фото поста приходят сразу, без склейки.\n\n"
     "💬 <b>В любом чате</b> — набери <code>@имя_бота</code> и ссылку или название трека, "
     "не добавляя меня в чат.\n\n"
     "🧩 <b>Сервисы</b> — кнопка ниже покажет всё, что умеет бот: какие сайты "
@@ -99,7 +101,8 @@ HELP_TEXT = (
     "• <code>https://youtu.be/...</code> — видео или mp3 с YouTube\n"
     "• <code>instagram.com/p/...</code>, <code>reddit.com/r/...</code>, "
     "<code>rutube.ru/video/...</code>, <code>pinterest.com/pin/...</code> — сервисы\n"
-    "• <code>https://vk.ru/video...</code> или <code>vk.ru/wall...</code> — видео из VK\n"
+    "• <code>https://vk.ru/video...</code> или <code>vk.ru/wall...</code> — видео "
+    "и все фото из поста VK\n"
     "• <code>https://www.furaffinity.net/view/12345678/</code> — картинка с FurAffinity\n"
     "• <code>@имя_бота https://tiktok.com/...</code> — прямо в любом чате\n"
     "• <code>https://x.com/…/status/…</code> — до 20 фото и видео поста, "
@@ -1422,6 +1425,86 @@ async def cb_x_post(callback: CallbackQuery) -> None:
         _drop_x_post(token)
 
 
+async def handle_vk(message: Message, url: str) -> None:
+    """Пост VK: отдаём все фото сразу альбомами — без склейки, как в X."""
+    status = await message.answer("⬇️ Скачиваю пост VK…")
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(dir=DOWNLOADS_DIR))
+    progress = ProgressBar(status, "⬇️ Скачиваю пост VK…")
+    token, cancel = _start_job()
+    stop_task = asyncio.create_task(_show_stop_button(status, token, progress))
+    user_id = message.from_user.id if message.from_user else None
+    try:
+        try:
+            async with _semaphore:
+                files, info = await asyncio.wait_for(
+                    download_vk(url, tmp_dir, on_progress=progress.update, cancel=cancel),
+                    timeout=600,
+                )
+        except DownloadCancelled:
+            await _cleanup_notice(status, "⏹ Остановлено.")
+            return
+        except DownloadError as exc:
+            await _cleanup_notice(status, f"❌ {html.escape(str(exc))}")
+            return
+        except asyncio.TimeoutError:
+            await _cleanup_notice(status, "❌ VK отвечал слишком долго. Попробуйте ещё раз.")
+            return
+        except Exception:  # noqa: BLE001
+            log.exception("VK download failed: %s", url)
+            await _cleanup_notice(status, "❌ Не получилось скачать пост VK.")
+            return
+        finally:
+            await progress.stop()
+
+        images = [p for p in files if p.suffix.lower() in IMAGE_EXTS]
+        videos = [p for p in files if p.suffix.lower() in VIDEO_EXTS]
+
+        if len(files) == 1:
+            path = files[0]
+            size_mb = path.stat().st_size / (1024 * 1024)
+            if size_mb > MAX_UPLOAD_MB:
+                await _cleanup_notice(
+                    status,
+                    f"❌ Файл {size_mb:.0f} МБ — больше лимита Telegram "
+                    f"({MAX_UPLOAD_MB} МБ).",
+                )
+                return
+            await deliver(
+                status,
+                path,
+                info,
+                url,
+                storage.normalize_url(url),
+                user_id=user_id,
+            )
+            return
+
+        if not files:
+            await _cleanup_notice(status, "❌ В посте не нашлось медиа.")
+            return
+
+        settings = storage.get_settings(user_id)
+        caption = ""
+        if settings["keep_source"]:
+            caption = f'<a href="{html.escape(url)}">ссылка на источник</a>'
+        if images:
+            await _send_photos(status, images, caption, settings["send_as_file"])
+        for path in videos:
+            await status.answer_video(
+                video=FSInputFile(path, filename=safe_filename(path.stem, path.suffix)),
+                supports_streaming=True,
+            )
+        try:
+            await status.edit_text("✅ Готово.")
+        except Exception:  # noqa: BLE001 — сообщение могли удалить
+            pass
+    finally:
+        stop_task.cancel()
+        _finish_job(token)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 async def handle_link(message: Message, url: str) -> None:
     if any(host in url for host in ("t.me/", "telegram.me/", "telegram.dog/")):
         await message.answer(
@@ -1434,6 +1517,11 @@ async def handle_link(message: Message, url: str) -> None:
     # X: свой путь — посты с несколькими фото получают меню «склеить/все»
     if is_x(url):
         await handle_x(message, url)
+        return
+
+    # VK: посты с фото — все фото сразу альбомами, без склейки
+    if is_vk(url):
+        await handle_vk(message, url)
         return
 
     status = await message.answer("⬇️ Скачиваю…")

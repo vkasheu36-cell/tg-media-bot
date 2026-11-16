@@ -561,46 +561,55 @@ def _vk_og_media(url: str) -> tuple[str, str] | None:
     Так разбираются ссылки на фото и посты, которые yt-dlp не понимает.
     """
     cookie = _vk_cookie_header()
-    headers = {
-        "User-Agent": VK_BROWSER_UA if cookie else VK_META_UA,
-        "Accept-Language": "ru-RU,ru;q=0.9",
-    }
+    attempts: list[tuple[str, str]] = []
     if cookie:
-        headers["Cookie"] = cookie
-    try:
-        request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=20) as response:
-            body = response.read().decode("utf-8", "replace")
-    except Exception as exc:  # noqa: BLE001
-        log.debug("VK: OG-страница не открылась: %s", exc)
-        return None
+        attempts.append((VK_BROWSER_UA, cookie))
+    attempts.append((VK_META_UA, ""))
+    if not cookie:
+        attempts.append((VK_BROWSER_UA, ""))
 
-    video = (
-        _meta_value(body, "og:video:secure_url")
-        or _meta_value(body, "og:video:url")
-        or _meta_value(body, "og:video")
-    )
-    if video:
-        if "video_ext.php" in video:
-            return "embed", video
-        if urlsplit(video).path.lower().endswith((".mp4", ".m4v", ".mov", ".webm")):
-            return "video", video
-        # og:video вида vkvideo.ru/video… — это страница, её и так берёт yt-dlp
-        return None
+    for user_agent, jar in attempts:
+        headers = {
+            "User-Agent": user_agent,
+            "Accept-Language": "ru-RU,ru;q=0.9",
+        }
+        if jar:
+            headers["Cookie"] = jar
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=20) as response:
+                candidate = response.read().decode("utf-8", "replace")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("VK: OG-страница не открылась: %s", exc)
+            continue
+        video = (
+            _meta_value(candidate, "og:video:secure_url")
+            or _meta_value(candidate, "og:video:url")
+            or _meta_value(candidate, "og:video")
+        )
+        if video:
+            if "video_ext.php" in video:
+                return "embed", video
+            if urlsplit(video).path.lower().endswith((".mp4", ".m4v", ".mov", ".webm")):
+                return "video", video
+            # og:video вида vkvideo.ru/video… — это страница, её и так берёт yt-dlp
+            continue
 
-    image = _meta_value(body, "og:image:secure_url") or _meta_value(body, "og:image")
-    if image.startswith("//"):
-        image = "https:" + image
-    if image.startswith("http"):
-        if _VK_VIDEO_PATH_RE.search(urlsplit(url).path):
-            image = ""  # у страницы видео фото-вложения нет
-        elif VK_STUB_IMAGE in image:
-            image = ""  # заглушка «Пост из ленты ВКонтакте», а не вложение
-        elif not _meta_value(body, "og:url"):
-            # у постов без вложения VK отдаёт только title/description/заглушку
-            image = ""
-        else:
-            return "photo", image
+        image = _meta_value(candidate, "og:image:secure_url") or _meta_value(
+            candidate, "og:image"
+        )
+        if image.startswith("//"):
+            image = "https:" + image
+        if image.startswith("http"):
+            if _VK_VIDEO_PATH_RE.search(urlsplit(url).path):
+                image = ""  # у страницы видео фото-вложения нет
+            elif VK_STUB_IMAGE in image:
+                image = ""  # заглушка «Пост из ленты ВКонтакте», а не вложение
+            elif not _meta_value(candidate, "og:url"):
+                # у постов без вложения VK отдаёт только title/description/заглушку
+                image = ""
+            else:
+                return "photo", image
 
     # Фото закрытого/18+ сообщества: OG-тегов нет, но с cookies входа
     # внутренний al_photos.php отдаёт прямую ссылку на файл.
@@ -625,6 +634,193 @@ def _vk_download_direct(kind: str, media_url: str, out_dir: Path) -> tuple[Path,
     path = out_dir / f"vk{ext}"
     path.write_bytes(data)
     return path, {"id": "", "title": "", "duration": None}
+
+
+# ---------------------------------------------------------------- VK: пост на стене
+# yt-dlp разбирает пост через внутренний wkview, а тот для закрытых стен отвечает
+# «You are not allowed to view this community's wall». Но сама страница поста
+# содержит все вложения в экранированном JSON ("attachments":[{"type":"photo"}…]),
+# и их видно даже без входа. Пробуем разные пары UA/cookies: браузер с чужими
+# (устаревшими) куками получает «Стена не найдена», а бот предпросмотра —
+# настоящий пост.
+
+VK_PHOTO_LIMIT = 20
+VK_WALL_RE = re.compile(r"/wall(-?\d+)_(\d+)", re.I)
+VK_PAGE_LOCKED = (
+    "VK не отдал пост: сообщество закрытое или пост скрыт от гостей.\n"
+    "Добавьте свежие vk.com-куки в VK_COOKIE на Render (минимум remixsid) "
+    "и пришлите ссылку снова."
+)
+
+
+def _vk_page(url: str, user_agent: str, cookie: str = "", timeout: int = 20) -> str | None:
+    """HTML страницы VK или None, если VK ответил ошибкой."""
+    headers = {
+        "User-Agent": user_agent,
+        # VK отдаёт полный HTML с вложениями только при Accept: */* (или без
+        # него). С «браузерным» Accept он переключается на облегчённую
+        # SPA-страницу, в которой нет JSON вложений.
+        "Accept": "*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    try:
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001 — 404 у закрытой стены это норма
+        log.debug("VK: страница не открылась (%s): %s", user_agent[:24], exc)
+        return None
+
+
+def _vk_json_arrays(text: str, key: str) -> list[list]:
+    """Все массивы вида "key":[…] из HTML (VK экранирует JSON в &quot;)."""
+    decoder = json.JSONDecoder()
+    found: list[list] = []
+    for match in re.finditer(rf'"{re.escape(key)}"\s*:\s*\[', text):
+        try:
+            value, _ = decoder.raw_decode(text, match.end() - 1)
+        except ValueError:
+            continue
+        if isinstance(value, list) and value not in found:
+            found.append(value)
+    return found
+
+
+def _vk_best_photo(photo: dict) -> str:
+    """Самый крупный размер из photo.sizes (обычно type=base или orig)."""
+    sizes = [
+        size
+        for size in (photo.get("sizes") or [])
+        if isinstance(size, dict) and str(size.get("url") or "")
+    ]
+    if not sizes:
+        return ""
+    best = max(
+        sizes,
+        key=lambda size: (int(size.get("width") or 0), int(size.get("height") or 0)),
+    )
+    return html.unescape(str(best.get("url") or "")).replace("\\/", "/")
+
+
+def _vk_page_photos(body: str) -> tuple[list[str], str]:
+    """Фото поста по порядку и подпись из OG-тегов."""
+    text = html.unescape(body)
+    photos: list[str] = []
+    for attachments in _vk_json_arrays(text, "attachments"):
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            if str(attachment.get("type") or "").lower() != "photo":
+                continue
+            photo = attachment.get("photo")
+            if not isinstance(photo, dict):
+                continue
+            url = _vk_best_photo(photo)
+            if url and url not in photos:
+                photos.append(url)
+        if photos:
+            break  # первый массив с вложениями — это сам пост, дальше не лезем
+    title = " ".join(
+        (
+            _meta_value(body, "og:description")
+            or _meta_value(body, "og:title")
+        ).split()
+    )
+    title = re.sub(r"<[^>]+>", " ", title)
+    return photos, " ".join(title.split())
+
+
+def vk_wall_media_sync(
+    url: str,
+    out_dir: Path,
+    cancel=None,
+    limit: int = VK_PHOTO_LIMIT,
+) -> tuple[list[Path], dict] | None:
+    """Все фото поста на стене VK. None — если фото нет или пост недоступен."""
+    url = _vk_url(url)
+    # Только посты на стене: у страниц видео/фото своя логика, и в их JSON
+    # могут попасть чужие рекомендации.
+    if not VK_WALL_RE.search(urlsplit(url).path):
+        return None
+    cookie = _vk_cookie_header()
+    attempts: list[tuple[str, str]] = []
+    if cookie:
+        attempts.append((VK_BROWSER_UA, cookie))
+    attempts.append((VK_META_UA, ""))
+    if not cookie:
+        attempts.append((VK_BROWSER_UA, ""))
+
+    photos: list[str] = []
+    title = ""
+    for user_agent, jar in attempts:
+        body = _vk_page(url, user_agent, jar)
+        if not body:
+            continue
+        found, found_title = _vk_page_photos(body)
+        if found:
+            photos, title = found, found_title
+            log.info("VK: в посте %s фото: %s", url, len(found))
+            break
+
+    if not photos:
+        return None
+
+    photos = photos[:limit]
+    match = VK_WALL_RE.search(urlsplit(url).path)
+    stem = f"vk_{match.group(2)}" if match else "vk"
+    headers = {
+        "User-Agent": VK_BROWSER_UA,
+        "Referer": "https://vk.com/",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    files: list[Path] = []
+    for index, photo_url in enumerate(photos, start=1):
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled()
+        try:
+            request = urllib.request.Request(photo_url, headers=headers)
+            with urllib.request.urlopen(request, timeout=120) as response:
+                data = response.read()
+        except Exception as exc:  # noqa: BLE001 — одно битое фото не валит пост
+            log.warning("VK: фото не скачалось (%s): %s", photo_url[:80], exc)
+            continue
+        ext = _guess_ext(photo_url)
+        if ext not in {".jpg", ".png", ".webp", ".gif"}:
+            ext = ".jpg"
+        path = out_dir / f"{stem}_{index}{ext}"
+        path.write_bytes(data)
+        files.append(path)
+
+    if not files:
+        return None
+
+    return files, {
+        "title": title[:120] or "Пост VK",
+        "uploader": "",
+        "duration": 0,
+        "vk_photos": len(files),
+    }
+
+
+async def download_vk(
+    url: str, out_dir: Path, on_progress=None, cancel=None
+) -> tuple[list[Path], dict]:
+    """Все фото поста VK; если фото нет — обычный путь (видео, аудио)."""
+    result = await asyncio.to_thread(vk_wall_media_sync, url, out_dir, cancel)
+    if result:
+        return result
+    log.info("VK: фото на странице не нашлось, пробую обычный путь: %s", url)
+    path, info = await download_media(
+        url, out_dir, on_progress=on_progress, cancel=cancel
+    )
+    return [path], info
+
+
+def is_vk(url: str) -> bool:
+    """Публичный алиас для handlers."""
+    return _is_vk(url)
 
 
 # ---------------------------------------------------------------- Reddit
@@ -1808,6 +2004,8 @@ def friendly_error(exc: Exception, url: str | None = None) -> str:
     # Готовое объяснение по фото VK не должно перебиваться общей веткой про login.
     if str(exc).startswith("VK: это фото"):
         return str(exc)
+    if "not allowed to view this community" in low or "vk:wallpost" in low:
+        return VK_PAGE_LOCKED
 
     if "requested format is not available" in low:
         if url and is_youtube(url):
@@ -5414,6 +5612,18 @@ def _download_media_sync(
     # VK: vk.ru → vk.com (yt-dlp понимает посты на стене только на vk.com)
     if _is_vk(url):
         url = _vk_url(url)
+        # Пост с фото yt-dlp не разбирает, а закрытую стену он вообще не
+        # открывает. Страницу поста читаем сами: фото лежат в её JSON.
+        try:
+            wall = vk_wall_media_sync(url, out_dir)
+        except DownloadCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("VK: страница поста не разобралась: %s", exc)
+            wall = None
+        if wall:
+            files, wall_info = wall
+            return files[0], wall_info
 
     # Hitmo: yt-dlp не умеет его страницы треков, качаем своим путём
     if _is_hitmo(url):

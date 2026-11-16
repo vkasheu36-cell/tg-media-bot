@@ -140,15 +140,16 @@ COBALT_SERVICES: str = (
 # Необязательно: прокси только для запросов в cobalt (не для Telegram).
 COBALT_PROXY: str | None = (os.getenv("COBALT_PROXY") or "").strip() or None
 
-# Cookies FurAffinity для работ 18+ (аккаунт second-acc).
-# FA отдаёт «взрослые» страницы только после входа, а вход по паролю с
-# серверного IP отвечает 503 — поэтому используются готовые cookies сессии.
-# Если задан FA_COOKIE в окружении — он важнее встроенного значения.
-# Если сессия протухла: войти в FA в браузере и обновить a и b.
-FA_COOKIE: str = (
-    os.getenv("FA_COOKIE")
-    or "a=d4a2cf01-652b-47c7-88fa-95a1285534fd; b=d32858cd-9796-4293-91da-7a2e100922ef"
-).strip()
+# Cookies FurAffinity (необязательно): строка вида `a=…; b=…` из браузера.
+# Нужны только для работ 18+, которые FA без входа не показывает.
+# Никаких значений по умолчанию: сессия — это личный секрет, её место в
+# Environment, а не в коде. Протухла — войдите в FA в браузере и обновите a и b.
+FA_COOKIE: str = (os.getenv("FA_COOKIE") or "").strip()
+
+# Необязательно: прокси только для FurAffinity.
+# В контейнере start.sh подставляет сюда локальный SOCKS5 Cloudflare WARP:
+# FA пробуется напрямую, а прокси — только если Cloudflare не пустил.
+FA_PROXY: str | None = (os.getenv("FA_PROXY") or "").strip() or None
 
 # Необязательно: cookies VK для фото из закрытых и 18+ сообществ.
 # VK отдаёт такие фото только после входа, поэтому анонимно бот видит
@@ -158,8 +159,9 @@ VK_COOKIE: str = (os.getenv("VK_COOKIE") or "").strip()
 
 # Необязательно: аккаунт FurAffinity, под которым бот входит сам.
 # Нужен только для работ 18+ (без входа FA отдаёт страницу без картинки).
-FA_LOGIN: str = (os.getenv("FA_LOGIN") or "second-acc").strip()
-FA_PASSWORD: str = (os.getenv("FA_PASSWORD") or "12983476kA!").strip()
+# Пусто по умолчанию: логин и пароль задаются в Environment, не в коде.
+FA_LOGIN: str = (os.getenv("FA_LOGIN") or "").strip()
+FA_PASSWORD: str = (os.getenv("FA_PASSWORD") or "").strip()
 
 # Необязательно: прокси для Telegram API (если api.telegram.org заблокирован).
 # Если не задан, используется PROXY.

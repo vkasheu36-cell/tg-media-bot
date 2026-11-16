@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import html
 import http.cookiejar
+import io
 import json
 import logging
 import re
@@ -32,6 +33,7 @@ from config import (
     FA_COOKIE,
     FA_LOGIN,
     FA_PASSWORD,
+    FA_PROXY,
     FFMPEG_DIR,
     MAX_UPLOAD_MB,
     POT_SERVER,
@@ -3918,8 +3920,10 @@ FA_ART_HOSTS = ("d.", "t.", "d2.", "t2.")
 FA_STATIC_MARKS = ("/themes/", "/img/", "/css/", "/js/")
 
 FA_BLOCKED = (
-    "FurAffinity не открылся: Cloudflare не пускает сервер.\n"
-    "Пришлите прямую ссылку на картинку (d.furaffinity.net/…)."
+    "FurAffinity не открылся: Cloudflare не пустил сервер даже после паузы.\n"
+    "Обычно это временно — попробуйте ту же ссылку через 5–10 минут. "
+    "Если не помогает, пришлите прямую ссылку на картинку "
+    "(d.furaffinity.net/…)."
 )
 FA_MATURE = (
     "FurAffinity не отдал картинку: работа помечена 18+, а такие он "
@@ -3930,6 +3934,19 @@ FA_MATURE = (
 _FA_LOCK = threading.Lock()
 _FA_STATE: dict = {"opener": None, "jar": None, "logged": False, "last_try": 0.0}
 _FA_LOGIN_COOLDOWN = 600.0  # не долбим FA логином чаще раза в 10 минут
+
+# Паузы перед повторами, если Cloudflare отдал челлендж. Вручную FA через
+# некоторое время открывается — значит, это временная проверка, а не бан.
+FA_RETRY_WAITS = (15.0, 35.0)
+# Для картинки паузы короче: её часто можно взять через WARP/зеркало.
+FA_IMAGE_WAITS = (10.0, 25.0)
+
+try:  # curl_cffi даёт TLS-отпечаток Chrome; без него работает urllib
+    from curl_cffi import requests as _cffi
+except Exception:  # noqa: BLE001
+    _cffi = None
+
+_FA_SESSION = None
 
 
 def _is_fa(url: str) -> bool:
@@ -4004,7 +4021,16 @@ def _fa_cookie_header() -> str:
     return "; ".join(parts)
 
 
-def _fa_headers(ua: str = FA_UA, **extra: str) -> dict[str, str]:
+def _fa_host(url: str) -> str:
+    return (urlsplit(url).netloc or "").lower()
+
+
+def _fa_headers(url: str = "", ua: str = FA_UA, **extra: str) -> dict[str, str]:
+    """Заголовки запроса. Cookies отдаём только самому FurAffinity.
+
+    Раньше FA_COOKIE уходил в любой запрос — включая сторонние зеркала
+    (translate.goog, web.archive.org, FAExport). Сессию туда отправлять нельзя.
+    """
     headers = {
         "User-Agent": ua,
         "Accept": (
@@ -4013,15 +4039,16 @@ def _fa_headers(ua: str = FA_UA, **extra: str) -> dict[str, str]:
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
-    cookie = _fa_cookie_header()
-    if cookie:
-        headers["Cookie"] = cookie
+    if _is_fa(url):
+        cookie = _fa_cookie_header()
+        if cookie:
+            headers["Cookie"] = cookie
     headers.update(extra)
     return headers
 
 
 def _fa_opener():
-    """Один opener на процесс: он и хранит cookies сессии FurAffinity."""
+    """Запасной путь без curl_cffi: urllib + общий cookie-jar."""
     with _FA_LOCK:
         if _FA_STATE["opener"] is None:
             jar = http.cookiejar.CookieJar()
@@ -4032,36 +4059,90 @@ def _fa_opener():
         return _FA_STATE["opener"]
 
 
-def _fa_get(url: str, ua: str = FA_UA, timeout: float = 25, **extra) -> str:
-    request = urllib.request.Request(url, headers=_fa_headers(ua, **extra))
+def _fa_session():
+    """Сессия curl_cffi с TLS-отпечатком Chrome.
+
+    Cloudflare проверяет не только cookies, но и отпечаток TLS/HTTP2: у urllib
+    он «питоновский», и челлендж прилетает даже с валидной сессией. curl_cffi
+    повторяет рукопожатие Chrome, поэтому шансов пройти заметно больше.
+    """
+    global _FA_SESSION
+    if _FA_SESSION is None and _cffi is not None:
+        try:
+            _FA_SESSION = _cffi.Session(impersonate="chrome")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("FurAffinity: curl_cffi не поднялся (%s), работаю через urllib", exc)
+    return _FA_SESSION
+
+
+def _fa_request(
+    method: str,
+    url: str,
+    *,
+    data: bytes | None = None,
+    timeout: float = 30,
+    ua: str = FA_UA,
+    proxy: str | None = None,
+    **extra: str,
+) -> bytes:
+    """Один HTTP-запрос к FA: curl_cffi с отпечатком Chrome, иначе urllib."""
+    headers = _fa_headers(url, ua, **extra)
+    session = _fa_session()
+    if session is not None:
+        response = session.request(
+            method,
+            url,
+            data=data,
+            headers=headers,
+            timeout=timeout,
+            proxy=proxy or None,
+            allow_redirects=True,
+        )
+        if response.status_code >= 400:
+            raise urllib.error.HTTPError(
+                url,
+                response.status_code,
+                f"HTTP {response.status_code}",
+                response.headers,
+                io.BytesIO(response.content),
+            )
+        return response.content
+
+    request = urllib.request.Request(url, data=data, headers=headers)
     with _fa_opener().open(request, timeout=timeout) as response:
-        return response.read().decode("utf-8", "replace")
+        return response.read()
+
+
+def _fa_get(
+    url: str, ua: str = FA_UA, timeout: float = 25, proxy: str | None = None, **extra
+) -> str:
+    return _fa_request("GET", url, timeout=timeout, ua=ua, proxy=proxy, **extra).decode(
+        "utf-8", "replace"
+    )
 
 
 def _fa_post(url: str, data: bytes, ua: str = FA_UA, timeout: float = 30) -> str:
-    request = urllib.request.Request(
+    return _fa_request(
+        "POST",
         url,
         data=data,
-        headers=_fa_headers(
-            ua,
-            **{
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": (
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                    "image/avif,image/webp,*/*;q=0.8"
-                ),
-                "Referer": "https://www.furaffinity.net/login/",
-                "Origin": "https://www.furaffinity.net",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "same-origin",
-                "Sec-Fetch-User": "?1",
-            },
-        ),
-    )
-    with _fa_opener().open(request, timeout=timeout) as response:
-        return response.read().decode("utf-8", "replace")
+        timeout=timeout,
+        ua=ua,
+        **{
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8"
+            ),
+            "Referer": "https://www.furaffinity.net/login/",
+            "Origin": "https://www.furaffinity.net",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+        },
+    ).decode("utf-8", "replace")
 
 
 def _fa_raw_attr(tag: str, name: str) -> str:
@@ -4223,49 +4304,121 @@ def _fa_page_meta(body: str) -> tuple[str, str, str] | None:
     return _fa_page_image(body), title, author
 
 
-def _fa_fetch_page(sub_id: str) -> tuple[str, str, str] | None:
-    """Ищем страницу submission там, где Cloudflare её ещё отдаёт."""
-    direct = f"https://www.furaffinity.net/view/{sub_id}/"
-    quoted = urllib.parse.quote(direct, safe="")
-    sources = (
-        (direct, FA_UA),
-        (direct, "TelegramBot (like TwitterBot)"),
-        (
-            f"https://www-furaffinity-net.translate.goog/view/{sub_id}/"
-            "?_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en",
-            FA_UA,
-        ),
-        (f"https://www.translatetheweb.com/?from=&to=en&a={quoted}", FA_UA),
-        (f"https://web.archive.org/web/2025/{direct}", FA_UA),
+def _fa_looks_blocked(body: str) -> bool:
+    head = body[:4000].lower()
+    return (
+        "just a moment" in head
+        or "attention required" in head
+        or "cf-chl" in head
+        or "enable javascript and cookies" in head
     )
 
-    partial: tuple[str, str, str] | None = None
-    for source, user_agent in sources:
+
+def _fa_try(url: str, ua: str = FA_UA, proxy: str | None = None) -> str | None:
+    """Одна попытка: None, если Cloudflare/сеть не дали страницу."""
+    try:
+        return _fa_get(url, ua, proxy=proxy)
+    except urllib.error.HTTPError as exc:
+        wait = ""
         try:
-            body = _fa_get(source, user_agent)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("FurAffinity: %s не открылся: %s", source[:70], exc)
-            continue
+            if exc.headers and exc.headers.get("Retry-After"):
+                wait = f", Retry-After={exc.headers.get('Retry-After')}"
+        except Exception:  # noqa: BLE001
+            pass
+        log.debug("FurAffinity: %s -> HTTP %s%s", url[:70], exc.code, wait)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("FurAffinity: %s не открылся: %s", url[:70], exc)
+    return None
+
+
+def _fa_fetch_page(sub_id: str) -> tuple[str, str, str] | None:
+    """Ищем страницу submission: напрямую, после паузы и через WARP.
+
+    Cloudflare на FA срабатывает не всегда: вручную страница открывается через
+    некоторое время. Поэтому после челленджа ждём и повторяем, а если и это не
+    помогло — пробуем другой IP (FA_PROXY, в контейнере это Cloudflare WARP).
+    """
+    direct = f"https://www.furaffinity.net/view/{sub_id}/"
+    quoted = urllib.parse.quote(direct, safe="")
+
+    partial: tuple[str, str, str] | None = None
+    blocked = False
+
+    def consume(source: str, body: str) -> tuple[str, str, str] | None:
         meta = _fa_page_meta(body)
         if meta is None:
             log.debug("FurAffinity: %s — не страница работы", source[:70])
-            continue
+            return None
         if meta[0]:
             log.info("FurAffinity: картинка найдена через %s", source[:70])
             return meta
         # страница открылась, но картинки нет — обычно это 18+ без входа
+        nonlocal partial
         if partial is None:
             partial = meta
         log.debug("FurAffinity: на %s картинки нет (%s байт)", source[:70], len(body))
+        return None
+
+    def direct_round() -> tuple[str, str, str] | None:
+        nonlocal blocked
+        body = _fa_try(direct)
+        if body is None:
+            blocked = True
+            return None
+        if _fa_looks_blocked(body):
+            blocked = True
+            log.info("FurAffinity: Cloudflare-челлендж на прямой ссылке")
+            return None
+        return consume(direct, body)
+
+    found = direct_round()
+
+    if not found:
+        # запасные пути: страница может отдаваться через чужие краулеры
+        for source, user_agent in (
+            (direct, "TelegramBot (like TwitterBot)"),
+            (
+                f"https://www-furaffinity-net.translate.goog/view/{sub_id}/"
+                "?_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en",
+                FA_UA,
+            ),
+            (f"https://www.translatetheweb.com/?from=&to=en&a={quoted}", FA_UA),
+            (f"https://web.archive.org/web/2025/{direct}", FA_UA),
+        ):
+            body = _fa_try(source, user_agent)
+            if body is None:
+                continue
+            found = consume(source, body)
+            if found:
+                return found
+
+    if not found and blocked:
+        # временный челлендж: ждём и повторяем, как это делает живой браузер
+        for delay in FA_RETRY_WAITS:
+            log.info("FurAffinity: жду %.0f с и пробую снова", delay)
+            time.sleep(delay)
+            found = direct_round()
+            if found:
+                return found
+
+    if not found and FA_PROXY:
+        # другой IP: WARP в контейнере или свой прокси из FA_PROXY
+        log.info("FurAffinity: пробую через прокси %s", FA_PROXY)
+        body = _fa_try(direct, proxy=FA_PROXY)
+        if body is not None and not _fa_looks_blocked(body):
+            found = consume(direct, body)
+            if found:
+                return found
 
     # FAExport — сторонний API поверх FurAffinity (тот же Cloudflare, но свой IP)
     try:
         data = json.loads(
-            _fa_get(
+            _fa_request(
+                "GET",
                 f"https://faexport.spangle.org.uk/submission/{sub_id}.json",
                 timeout=20,
                 **{"Accept": "application/json"},
-            )
+            ).decode("utf-8", "replace")
         )
         image = str(data.get("file_url") or "").strip()
         if image.startswith("http"):
@@ -4287,17 +4440,79 @@ def _fa_image_ok(data: bytes) -> bool:
     return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
 
 
-def _fa_download(image_url: str) -> bytes:
+def _fa_download(image_url: str, proxy: str | None = None, timeout: float = 90) -> bytes:
     """Файл с CDN: без Referer и браузерных заголовков Cloudflare режет."""
-    request = urllib.request.Request(
+    return _fa_request(
+        "GET",
         image_url,
-        headers=_fa_headers(
-            Accept="image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            Referer="https://www.furaffinity.net/",
-        ),
+        timeout=timeout,
+        proxy=proxy,
+        Accept="image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        Referer="https://www.furaffinity.net/",
     )
-    with _fa_opener().open(request, timeout=90) as response:
-        return response.read()
+
+
+def _fa_cdn_alias(image_url: str) -> str | None:
+    """Старое и новое имя CDN: d.facdn.net ↔ d.furaffinity.net."""
+    parts = urlsplit(image_url)
+    host = (parts.netloc or "").lower()
+    if host == "d.furaffinity.net":
+        host = "d.facdn.net"
+    elif host == "d.facdn.net":
+        host = "d.furaffinity.net"
+    else:
+        return None
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+
+
+def _fa_fetch_image(image_url: str) -> bytes:
+    """Картинка с CDN: напрямую, после паузы, через прокси и по старому имени.
+
+    Cloudflare на FA срабатывает волнами: вручную страница открывается через
+    некоторое время. Поэтому сначала пробуем сразу, потом ждём и повторяем,
+    и только затем идём через FA_PROXY (в контейнере — Cloudflare WARP).
+    """
+    alias = _fa_cdn_alias(image_url)
+    direct_urls = [image_url] + ([alias] if alias else [])
+
+    def attempt(target: str, proxy: str | None, label: str) -> bytes | None:
+        try:
+            data = _dns_retry(lambda: _fa_download(target, proxy=proxy))
+        except Exception as exc:  # noqa: BLE001
+            log.info("FurAffinity: %s %s не отдал файл: %s", label, target[:70], exc)
+            return None
+        if _fa_image_ok(data):
+            log.info("FurAffinity: файл получен (%s, %s байт)", label, len(data))
+            return data
+        log.info(
+            "FurAffinity: %s %s вернул не картинку (%s байт)",
+            label,
+            target[:70],
+            len(data),
+        )
+        return None
+
+    for target in direct_urls:
+        data = attempt(target, None, "напрямую")
+        if data:
+            return data
+
+    for delay in FA_IMAGE_WAITS:
+        log.info("FurAffinity: жду %.0f с и пробую картинку снова", delay)
+        time.sleep(delay)
+        for target in direct_urls:
+            data = attempt(target, None, f"повтор через {delay:.0f} с")
+            if data:
+                return data
+
+    if FA_PROXY:
+        log.info("FurAffinity: картинка через прокси %s", FA_PROXY)
+        for target in direct_urls:
+            data = attempt(target, FA_PROXY, "через FA_PROXY")
+            if data:
+                return data
+
+    return b""
 
 
 def _fa_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, dict]:
@@ -4350,27 +4565,15 @@ def _fa_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, 
                 )
             raise DownloadError(message)
 
-    try:
-        data = _dns_retry(lambda: _fa_download(image))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("FurAffinity: файл не скачался (%s): %s", image, exc)
+    data = _fa_fetch_image(image)
+    if not data:
         error = DownloadError(
-            "FurAffinity не отдал картинку: Cloudflare блокирует серверный IP."
+            "FurAffinity не отдал картинку: Cloudflare не пустил сервер "
+            "даже после паузы и через прокси.\n"
+            "Обычно это временно — повторите ссылку через 10–15 минут. "
+            "Превью ниже подгружает сам Telegram."
         )
         error.image_url = image  # handlers покажет превью силами Telegram
-        raise error from exc
-
-    if not _fa_image_ok(data):
-        log.warning(
-            "FurAffinity: вместо картинки пришло %s (%s байт): %s",
-            "HTML" if b"<html" in data[:500].lower() else "неизвестный формат",
-            len(data),
-            image,
-        )
-        error = DownloadError(
-            "FurAffinity отдал вместо картинки страницу Cloudflare."
-        )
-        error.image_url = image  # превью подтянет Telegram
         raise error
 
     budget = MAX_UPLOAD_MB * 1024 * 1024
@@ -4402,15 +4605,63 @@ def _fa_cookie_names() -> str:
 
 def _fa_diagnose_sync(url: str) -> str:
     """Отчёт о том, что FurAffinity реально отдаёт серверу (для /fa_debug)."""
+    if _fa_is_art(url):
+        lines = [
+            f"URL картинки: {url}",
+            "TLS-отпечаток: "
+            + (
+                "Chrome (curl_cffi)"
+                if _cffi is not None
+                else "urllib (без curl_cffi)"
+            ),
+            f"FA_PROXY: {FA_PROXY or 'не задан'}",
+        ]
+        attempts: list[tuple[str, str | None]] = [("напрямую", None)]
+        if FA_PROXY:
+            attempts.append(("через FA_PROXY", FA_PROXY))
+        for label, proxy in attempts:
+            try:
+                data = _fa_download(url, proxy=proxy, timeout=30)
+            except Exception as exc:  # noqa: BLE001
+                lines.append(
+                    f"Файл ({label}): {type(exc).__name__}: {str(exc)[:110]}"
+                )
+                continue
+            lines.append(
+                f"Файл ({label}): {len(data)} байт, "
+                f"{'картинка' if _fa_image_ok(data) else 'НЕ картинка (HTML Cloudflare)'}"
+            )
+        alias = _fa_cdn_alias(url)
+        if alias:
+            try:
+                data = _fa_download(alias, timeout=30)
+                lines.append(
+                    f"Файл (зеркало {urlsplit(alias).netloc}): {len(data)} байт, "
+                    f"{'картинка' if _fa_image_ok(data) else 'НЕ картинка'}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"Файл (зеркало): {type(exc).__name__}: {str(exc)[:110]}")
+        lines.append(
+            "Совет: если напрямую 403, а через FA_PROXY картинка — значит, "
+            "Cloudflare режет IP Render и спасает только WARP."
+        )
+        return "\n".join(lines)
+
     match = FA_VIEW_RE.search(url)
     if not match:
-        return "Это не ссылка на работу FurAffinity. Нужен вид /view/<id>/."
+        return (
+            "Это не ссылка на работу FurAffinity. Нужен вид /view/<id>/ "
+            "или прямая ссылка на картинку d.furaffinity.net/…"
+        )
     sub_id = match.group(1)
     direct = f"https://www.furaffinity.net/view/{sub_id}/"
 
     lines = [
         f"URL: {direct}",
         f"Логин: {FA_LOGIN or '—'} | FA_COOKIE: {'задан' if FA_COOKIE else 'нет'}",
+        "TLS-отпечаток: "
+        + ("Chrome (curl_cffi)" if _cffi is not None else "urllib (без curl_cffi)"),
+        f"FA_PROXY: {FA_PROXY or 'не задан'}",
     ]
 
     body = ""
@@ -4426,6 +4677,13 @@ def _fa_diagnose_sync(url: str) -> str:
             continue
         if body:
             break
+
+    if not body and FA_PROXY:
+        try:
+            body = _fa_get(direct, proxy=FA_PROXY)
+            lines.append(f"Страница (через FA_PROXY): {len(body)} байт")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"Страница (через FA_PROXY): {type(exc).__name__}: {str(exc)[:110]}")
 
     if not body:
         lines.append("Итог: страница не открылась — Cloudflare режет сервер.")
@@ -4521,6 +4779,20 @@ def _fa_diagnose_sync(url: str) -> str:
                 )
         except Exception as exc:  # noqa: BLE001
             lines.append(f"С аккаунтом: {type(exc).__name__}: {str(exc)[:110]}")
+
+    if final_image:
+        for label, proxy in (("напрямую", None), ("через FA_PROXY", FA_PROXY)):
+            if label == "через FA_PROXY" and not FA_PROXY:
+                continue
+            try:
+                data = _fa_download(final_image, proxy=proxy, timeout=30)
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"Файл ({label}): {type(exc).__name__}: {str(exc)[:110]}")
+                continue
+            lines.append(
+                f"Файл ({label}): {len(data)} байт, "
+                f"{'картинка' if _fa_image_ok(data) else 'НЕ картинка (HTML Cloudflare)'}"
+            )
 
     lines.append("Итог: картинка " + ("найдена" if final_image else "не найдена"))
     return "\n".join(lines)

@@ -79,8 +79,8 @@ START_TEXT = (
     "📥 <b>Медиа по ссылке</b> — кинь ссылку на YouTube, TikTok, VK, Twitter/X, "
     "Instagram, Reddit, Rutube, Vimeo, SoundCloud, Pinterest, FurAffinity и "
     "многое другое — пришлю файл.\n\n"
-    "🖼 <b>Посты X с фото</b> — до 20 картинок: можно склеить их в сетку, "
-    "собрать в одну ленту (если работа разрезана на панели) или скачать все.\n\n"
+    "🖼 <b>Посты X с фото</b> — до 20 картинок: можно склеить их в одну "
+    "ленту без промежутков или скачать все.\n\n"
     "💬 <b>В любом чате</b> — набери <code>@имя_бота</code> и ссылку или название трека, "
     "не добавляя меня в чат.\n\n"
     "🧩 <b>Сервисы</b> — кнопка ниже покажет всё, что умеет бот: какие сайты "
@@ -103,7 +103,7 @@ HELP_TEXT = (
     "• <code>https://www.furaffinity.net/view/12345678/</code> — картинка с FurAffinity\n"
     "• <code>@имя_бота https://tiktok.com/...</code> — прямо в любом чате\n"
     "• <code>https://x.com/…/status/…</code> — до 20 фото и видео поста, "
-    "с кнопками «сетка»/«лента»/«все фото»\n"
+    "с кнопками «склеить в ленту»/«все фото»\n"
     "• <code>/services</code> или кнопка «🧩 Сервисы» — все доступные сервисы\n"
     "• <code>/settings</code> или кнопка «⚙️ Настройки» — «как файл»/«обычно» "
     "и ссылка на источник\n"
@@ -732,8 +732,9 @@ async def cmd_fa_debug(message: Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or "furaffinity" not in parts[1].lower():
         await message.answer(
-            "Пришлите ссылку на работу:\n"
-            "<code>/fa_debug https://www.furaffinity.net/view/123456/</code>"
+            "Пришлите ссылку на работу или картинку:\n"
+            "<code>/fa_debug https://www.furaffinity.net/view/123456/</code>\n"
+            "<code>/fa_debug https://d.furaffinity.net/art/…/…jpg</code>"
         )
         return
     status = await message.answer("🔎 Проверяю FurAffinity…")
@@ -1047,11 +1048,26 @@ async def cb_track(callback: CallbackQuery) -> None:
 
 
 async def _fa_preview(status: Message, url: str, detail: str) -> None:
-    """FurAffinity закрыт Cloudflare — просим Telegram показать превью.
+    """FurAffinity закрыт Cloudflare — просим Telegram показать картинку.
 
-    Картинку тянет уже сервер Telegram: его краулер FurAffinity пускает,
-    поэтому пользователь хотя бы видит работу и может её сохранить.
+    Сервер Telegram FurAffinity пускает, поэтому ссылку можно отдать ему:
+    `sendPhoto` с URL скачивает файл на стороне Telegram, а не на Render.
+    Если и это не выйдет — остаётся большое превью ссылки.
     """
+    text = (
+        f"🖼 {html.escape(detail)}\n"
+        "Картинку загрузил сервер Telegram — сохранить можно из неё."
+    )
+    try:
+        await status.answer_photo(photo=url, caption=text)
+        try:
+            await status.delete()
+        except Exception:  # noqa: BLE001 — сообщение могли удалить
+            pass
+        return
+    except Exception:  # noqa: BLE001
+        log.debug("FurAffinity: sendPhoto по URL не сработал", exc_info=True)
+
     text = f"🖼 {html.escape(detail)}\nПревью ниже подгружает сам Telegram."
     try:
         await status.edit_text(
@@ -1070,6 +1086,8 @@ async def _fa_preview(status: Message, url: str, detail: str) -> None:
 
 
 X_COLLAGE_MAX = 20
+# Шире Telegram не примет картинку, поэтому лента ужимается по высоте.
+X_COLLAGE_MAX_WIDTH = 10_000
 
 
 def _x_menu_kb(token: str, photos: int, videos: int) -> InlineKeyboardMarkup:
@@ -1077,19 +1095,8 @@ def _x_menu_kb(token: str, photos: int, videos: int) -> InlineKeyboardMarkup:
     if photos >= 2:
         kb.row(
             InlineKeyboardButton(
-                text=(
-                    "🖼 Склеить все фото в одно"
-                    if photos == 2
-                    else f"🖼 Склеить в сетку ({photos})"
-                ),
+                text=f"🖼 Склеить все фото в одно ({photos})",
                 callback_data=f"xp:{token}:col",
-            )
-        )
-    if photos >= 3:
-        kb.row(
-            InlineKeyboardButton(
-                text=f"➡️ Склеить в ленту ({photos})",
-                callback_data=f"xp:{token}:row",
             )
         )
     if photos:
@@ -1110,11 +1117,33 @@ def _x_menu_kb(token: str, photos: int, videos: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def _collage_sync(files: list[Path], dest: Path, layout: str = "grid") -> Path:
-    """Склеивает до 20 фото: сеткой или одной лентой (Pillow, в потоке).
+def _x_panel_size(path: Path) -> tuple[int, int] | None:
+    """Размер картинки с учётом EXIF-поворота (читается только заголовок)."""
+    try:
+        from PIL import Image
 
-    «Сетка» — компактный коллаж (до 5 колонок). «Лента» — все картинки в один
-    ряд: так собирают работу, которую автор разрезал на панели для поста X.
+        with Image.open(path) as src:
+            width, height = src.size
+            try:
+                orientation = int(src.getexif().get(274, 1) or 1)
+            except Exception:  # noqa: BLE001
+                orientation = 1
+    except Exception as exc:  # noqa: BLE001 — одно битое фото не отменяет всё
+        log.warning("склейка: пропускаю %s (%s)", path, exc)
+        return None
+    if orientation in (5, 6, 7, 8):
+        width, height = height, width
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _collage_sync(files: list[Path], dest: Path, layout: str | None = None) -> Path:
+    """Склеивает до 20 фото в одну ленту без промежутков (Pillow, в потоке).
+
+    Так собирают работу, которую автор разрезал на панели для поста X:
+    панели прижаты друг к другу, слева направо. `layout` больше не влияет
+    на результат — оставлен, чтобы старые меню продолжали работать.
     """
     try:
         from PIL import Image, ImageOps
@@ -1124,49 +1153,39 @@ def _collage_sync(files: list[Path], dest: Path, layout: str = "grid") -> Path:
         ) from None
 
     files = files[:X_COLLAGE_MAX]
-    planned = len(files)
-    cell = 1000 if planned <= 4 else 800 if planned <= 9 else 680
-    if layout == "row":
-        # лента не должна вылезти за 10 000 px: шире Telegram не примет фото
-        cell = min(
-            cell, max(320, (10_000 - 12 * max(0, planned - 1)) // max(1, planned))
-        )
-
-    images = []
+    panels: list[tuple[Path, tuple[int, int]]] = []
     for file in files:
+        size = _x_panel_size(file)
+        if size is not None:
+            panels.append((file, size))
+    if not panels:
+        raise DownloadError("Не удалось прочитать картинки для склейки.")
+
+    count = len(panels)
+    height = 1000 if count <= 4 else 800 if count <= 9 else 680
+    widths = [max(1, round(w * height / h)) for _, (w, h) in panels]
+    if sum(widths) > X_COLLAGE_MAX_WIDTH:
+        height = max(1, height * X_COLLAGE_MAX_WIDTH // sum(widths))
+        widths = [max(1, round(w * height / h)) for _, (w, h) in panels]
+
+    canvas = Image.new("RGB", (max(1, sum(widths)), height), (255, 255, 255))
+    x = 0
+    for (file, _size), width in zip(panels, widths):
         try:
             with Image.open(file) as src:
                 img = ImageOps.exif_transpose(src).convert("RGB")
-                img.thumbnail((cell, cell), Image.LANCZOS)
-                images.append(img.copy())
-        except Exception as exc:  # noqa: BLE001 — одно битое фото не отменяет всё
-            log.warning("склейка: пропускаю %s (%s)", file, exc)
-    if not images:
-        raise DownloadError("Не удалось прочитать картинки для склейки.")
+                if img.size != (width, height):
+                    img = img.resize((width, height), Image.LANCZOS)
+                canvas.paste(img, (x, 0))
+        except Exception as exc:  # noqa: BLE001 — панель пропускаем, лента остаётся
+            log.warning("склейка: не вставилась %s (%s)", file, exc)
+            continue
+        x += width
 
-    count = len(images)
-    gap = 12
-    if layout == "row":
-        row_height = max(img.height for img in images)
-        width = sum(img.width for img in images) + gap * (count - 1)
-        canvas = Image.new("RGB", (max(1, width), row_height), (255, 255, 255))
-        x = 0
-        for img in images:
-            canvas.paste(img, (x, (row_height - img.height) // 2))
-            x += img.width + gap
-    else:
-        cols = 1 if count == 1 else min(5, math.ceil(math.sqrt(count)))
-        rows = math.ceil(count / cols)
-        canvas = Image.new(
-            "RGB",
-            (cols * cell + (cols - 1) * gap, rows * cell + (rows - 1) * gap),
-            (255, 255, 255),
-        )
-        for index, img in enumerate(images):
-            col, row = index % cols, index // cols
-            x = col * (cell + gap) + (cell - img.width) // 2
-            y = row * (cell + gap) + (cell - img.height) // 2
-            canvas.paste(img, (x, y))
+    if x <= 0:
+        raise DownloadError("Не удалось прочитать картинки для склейки.")
+    if x < canvas.width:  # если панель выпала, убираем белый хвост
+        canvas = canvas.crop((0, 0, x, height))
 
     # держим файл в пределах лимита фото Telegram (10 МБ): сначала качество,
     # потом уже размер полотна
@@ -1304,7 +1323,7 @@ async def handle_x(message: Message, url: str) -> None:
         body = "🖼 <b>Пост X скачан</b>\n"
         if title:
             body += f"<i>{html.escape(title)}</i>\n"
-        body += f"{counts}\n\nСклеить в сетку или в ленту, или скачать по отдельности?"
+        body += f"{counts}\n\nСклеить все фото в одну ленту или скачать по отдельности?"
         try:
             await status.edit_text(
                 body, reply_markup=_x_menu_kb(xid, len(images), len(videos))
@@ -1360,11 +1379,10 @@ async def cb_x_post(callback: CallbackQuery) -> None:
     try:
         if status is None:
             return
-        if action in {"col", "row"}:
-            layout = "row" if action == "row" else "grid"
-            dest = post.folder / f"collage_{layout}.jpg"
+        if action in {"col", "row"}:  # row — старое меню, теперь та же лента
+            dest = post.folder / "collage.jpg"
             try:
-                await asyncio.to_thread(_collage_sync, images, dest, layout)
+                await asyncio.to_thread(_collage_sync, images, dest)
             except Exception as exc:  # noqa: BLE001
                 log.exception("X: склейка не удалась")
                 await status.answer(f"❌ Не получилось склеить: {html.escape(str(exc)[:160])}")

@@ -5,7 +5,8 @@
 # адреса (HTTP 429 на watch, 403 на player API) — cookies не помогают.
 # usque поднимает Cloudflare WARP по MASQUE поверх обычного TCP/HTTP2
 # (UDP на PaaS обычно закрыт) и отдаёт локальный SOCKS5. Прокси получает
-# только yt-dlp через YT_PROXY; Telegram и остальные сервисы идут напрямую.
+# yt-dlp через YT_PROXY, а FurAffinity — только как запасной путь через
+# FA_PROXY. Telegram и остальные сервисы идут напрямую.
 #
 # Переключатели:
 #   WARP=1        — включить туннель (по умолчанию)
@@ -66,7 +67,14 @@ if [ "$WARP" = "1" ] && [ -x "$USQUE_BIN" ]; then
         if [ "$ready" = "1" ]; then
             YT_PROXY="socks5h://127.0.0.1:$WARP_PORT"
             export YT_PROXY
-            warp_log "туннель поднят, YouTube пойдёт через $YT_PROXY"
+            # FurAffinity тоже пробуем через WARP — но только как запасной
+            # путь: сначала бот стучится напрямую и ждёт, пока Cloudflare
+            # перестанет показывать челлендж.
+            if [ -z "${FA_PROXY:-}" ]; then
+                FA_PROXY="$YT_PROXY"
+                export FA_PROXY
+            fi
+            warp_log "туннель поднят: YouTube и FurAffinity пойдут через $YT_PROXY"
         else
             warp_log "туннель не поднялся — работаю без прокси"
             kill "$usque_pid" 2>/dev/null || true

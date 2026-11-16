@@ -26,7 +26,7 @@ Long polling на Render не годится — платформа ждёт о�
    - `BOT_TOKEN` = токен от @BotFather;
    - `OWNER_IDS` = ваш Telegram ID (`/id` в боте) — включит приватный режим (необязательно, но рекомендую);
    - `MAX_UPLOAD_MB` = `49` (необязательно);
-   - `FA_COOKIE` = `a=…; b=…` для работ FurAffinity 18+ (необязательно);
+   - `FA_COOKIE` = `a=…; b=…` для работ FurAffinity 18+ (необязательно); если FA отвечает Cloudflare-челленджем, бот сам подождёт и повторит запрос, а затем попробует WARP;
    - `COBALT_API` = `https://ваш-cobalt|Api-Key …` для TikTok/Instagram/Reddit/Rutube/Pinterest и других (необязательно); VK и X идут своим путём, без cobalt;
    - `COBALT_YOUTUBE` = `1` — гнать YouTube через cobalt (по умолчанию `0`: yt-dlp + cookies);
    - `COBALT_SERVICES` = `all` — все сервисы cobalt, кроме YouTube (необязательно; `none` выключает);
@@ -34,9 +34,10 @@ Long polling на Render не годится — платформа ждёт о�
 5. **Create Web Service** и подождать 3–5 минут сборки.
 
 В образе уже есть **Cloudflare WARP** (`usque`): при старте `start.sh`
-поднимает локальный SOCKS5 и отдаёт его только yt-dlp. Это нужно, потому что
-YouTube блокирует датацентровые IP Render (HTTP 429/403). Отключается
-переменной `WARP=0` (см. раздел 5).
+поднимает локальный SOCKS5 и отдаёт его yt-dlp (`YT_PROXY`), а как запасной
+путь — FurAffinity (`FA_PROXY`). Это нужно, потому что YouTube блокирует
+датацентровые IP Render (HTTP 429/403), а FA встречает их челленджем
+Cloudflare. Отключается переменной `WARP=0` (см. раздел 5).
 
 > **Не вставляйте cookies в переменную `YT_COOKIES`.** Linux не принимает
 > аргументы длиннее ~128 КБ, поэтому большой `cookies.txt` (150+ строк) валит

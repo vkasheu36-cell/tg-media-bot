@@ -24,9 +24,10 @@ Long polling на Render не годится — платформа ждёт о�
    - **Region**: ближайший к вам (например, Frankfurt).
 4. **Environment Variables** → добавить:
    - `BOT_TOKEN` = токен от @BotFather;
+   - `OWNER_IDS` = ваш Telegram ID (`/id` в боте) — включит приватный режим (необязательно, но рекомендую);
    - `MAX_UPLOAD_MB` = `49` (необязательно);
    - `FA_COOKIE` = `a=…; b=…` для работ FurAffinity 18+ (необязательно);
-   - `COBALT_API` = `https://ваш-cobalt|Api-Key …` для TikTok/Instagram/Reddit/Rutube/VK/Pinterest и других (необязательно);
+   - `COBALT_API` = `https://ваш-cobalt|Api-Key …` для TikTok/Instagram/Reddit/Rutube/Pinterest и других (необязательно); VK и X идут своим путём, без cobalt;
    - `COBALT_YOUTUBE` = `1` — гнать YouTube через cobalt (по умолчанию `0`: yt-dlp + cookies);
    - `COBALT_SERVICES` = `all` — все сервисы cobalt, кроме YouTube (необязательно; `none` выключает);
    - `COOKIES_FILE` = `/etc/secrets/cookies.txt` (Secret File) — для YouTube и Instagram.
@@ -67,6 +68,17 @@ HTTP-сервер слушает 0.0.0.0:10000
 5. Save.
 
 Теперь контейнер не засыпает и бот отвечает сразу.
+
+Если бот всё равно иногда «молчит» — напишите ему `/ping`. Команда покажет
+сборку, аптайм, время последнего апдейта, очередь Telegram и последнюю ошибку
+доставки. Если аптайм маленький — контейнер перезапускался (Render рестартит
+сервис при OOM/сбое); если «в очереди Telegram» растёт — пингер не стучит или
+вебхук отвалился. Свежую ошибку доставки встроенный сторож исправляет сам:
+раз в 5 минут проверяет `getWebhookInfo` и переставляет вебхук.
+
+Важно: с этой сборки вебхук ставится с `drop_pending_updates=False`, поэтому
+сообщения, написанные во время сна/холодного старта, больше не теряются —
+Telegram дошлёт их, когда контейнер поднимется.
 
 ## 4. Выключить локальную копию
 

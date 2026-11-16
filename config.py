@@ -14,6 +14,41 @@ BASE_DIR = Path(__file__).resolve().parent
 
 BOT_TOKEN: str = (os.getenv("BOT_TOKEN") or "").strip()
 
+# Версия сборки — видна в /ping: по ней сразу понятно, доехал ли новый код.
+BUILD: str = "2026-11-16"
+
+
+def _parse_ids(raw: str) -> set[int]:
+    """Разбирает «123,456» / «123 456» / «123;456» в набор Telegram ID."""
+    ids: set[int] = set()
+    for chunk in raw.replace(";", ",").replace(" ", ",").split(","):
+        chunk = chunk.strip()
+        if chunk.isdigit():
+            ids.add(int(chunk))
+    return ids
+
+
+# Приватный режим: бот отвечает только этим Telegram ID (через запятую).
+# Пусто — бот открыт всем (так он вёл себя раньше). Свой ID показывает /id.
+OWNER_IDS: set[int] = _parse_ids(
+    os.getenv("OWNER_IDS") or os.getenv("OWNER_ID") or ""
+)
+
+
+def is_owner(user_id: int | None) -> bool:
+    """Пускать ли пользователя. Пока OWNER_IDS пуст — пускаем всех."""
+    if not OWNER_IDS:
+        return True
+    if user_id is None:
+        return False
+    return int(user_id) in OWNER_IDS
+
+
+PRIVATE_TEXT = (
+    "🔒 Это приватный бот — доступ только у владельца.\n"
+    "Если это ваш бот, добавьте свой ID в переменную OWNER_IDS."
+)
+
 # Необязательно: путь к cookies.txt (YouTube, Instagram, TikTok и т.д.)
 COOKIES_FILE: str | None = (os.getenv("COOKIES_FILE") or "").strip() or None
 

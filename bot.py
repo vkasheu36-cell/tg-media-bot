@@ -13,11 +13,19 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineQuery,
+    Message,
+    Update,
+)
 
+import runtime
 import storage
 from config import (
     BOT_TOKEN,
+    BUILD,
     COBALT_API,
     COBALT_SERVICES,
     COBALT_YOUTUBE,
@@ -25,12 +33,15 @@ from config import (
     DOWNLOADS_DIR,
     FFMPEG_DIR,
     MAX_UPLOAD_MB,
+    OWNER_IDS,
     PORT,
+    PRIVATE_TEXT,
     PROXY,
     PUBLIC_URL,
     TELEGRAM_PROXY,
     WEBHOOK_SECRET,
     YT_PROXY,
+    is_owner,
 )
 from downloader import js_runtime_report
 from handlers import router
@@ -47,8 +58,54 @@ class _UpdateLogger(BaseMiddleware):
     chosen_inline_result (Telegram шлёт его только при включённом inline-фидбеке)."""
 
     async def __call__(self, handler, event, data):
-        log.info("update: %s", getattr(event, "event_type", type(event).__name__))
+        kind = getattr(event, "event_type", type(event).__name__)
+        runtime.mark_update(str(kind))
+        log.info("update: %s", kind)
         return await handler(event, data)
+
+
+class _AccessMiddleware(BaseMiddleware):
+    """Приватный режим: всё, что приходит не от OWNER_IDS, вежливо отбиваем.
+
+    Стоит внешним middleware на dp.update, поэтому закрывает и сообщения,
+    и кнопки, и inline-режим — включая чужие chosen_inline_result.
+    """
+
+    async def __call__(self, handler, event: Update, data):
+        try:
+            inner = event.event
+        except ValueError:  # пустой апдейт — нечего проверять
+            return await handler(event, data)
+        user = getattr(inner, "from_user", None)
+        if is_owner(user.id if user else None):
+            return await handler(event, data)
+
+        runtime.mark_blocked()
+        log.info(
+            "доступ закрыт: %s от %s (@%s)",
+            getattr(inner, "event_type", type(inner).__name__),
+            user.id if user else "?",
+            user.username if user and user.username else "—",
+        )
+        try:
+            if isinstance(inner, Message):
+                text = PRIVATE_TEXT
+                if user:
+                    text += (
+                        f"\n\nВаш ID: <code>{user.id}</code> — добавьте его в "
+                        "OWNER_IDS, если это ваш бот."
+                    )
+                await inner.answer(text)
+            elif isinstance(inner, CallbackQuery):
+                alert = PRIVATE_TEXT
+                if user:
+                    alert += f"\nВаш ID: {user.id}"
+                await inner.answer(alert, show_alert=True)
+            elif isinstance(inner, InlineQuery):
+                await inner.answer([], cache_time=0, is_personal=True)
+        except Exception as exc:  # noqa: BLE001 — отказ не должен валить обработчик
+            log.debug("не удалось ответить на чужой апдейт: %s", exc)
+        return None
 
 
 def _prepare_downloads_dir() -> None:
@@ -88,6 +145,7 @@ async def main() -> None:
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.outer_middleware(_UpdateLogger())
+    dp.update.outer_middleware(_AccessMiddleware())
     dp.include_router(router)
     dp.include_router(inline_router)
 
@@ -117,6 +175,8 @@ async def main() -> None:
                 BotCommand(command="help", description="Помощь"),
                 BotCommand(command="settings", description="Настройки"),
                 BotCommand(command="services", description="Доступные сервисы"),
+                BotCommand(command="ping", description="Жив ли бот и доставка"),
+                BotCommand(command="id", description="Мой Telegram ID"),
                 BotCommand(command="yt_debug", description="Диагностика YouTube"),
             ]
         )
@@ -124,9 +184,17 @@ async def main() -> None:
         log.warning("не удалось обновить команды: %s", exc)
 
     storage.cleanup()
+    if OWNER_IDS:
+        log.info("приватный режим: доступ у %s", ", ".join(str(i) for i in sorted(OWNER_IDS)))
+    else:
+        log.warning(
+            "OWNER_IDS не задан — бот открыт всем. Свой ID покажет /id, "
+            "потом добавьте OWNER_IDS=<id> в Environment."
+        )
     log.info(
-        "Бот запущен. Лимит отправки: %s МБ, ffmpeg: %s, cookies: %s, "
+        "Бот запущен (сборка %s). Лимит отправки: %s МБ, ffmpeg: %s, cookies: %s, "
         "cobalt: %s (%s), youtube: %s, %s, прокси Telegram: %s, прокси YouTube: %s",
+        BUILD,
         MAX_UPLOAD_MB,
         FFMPEG_DIR or "не найден",
         "есть" if COOKIES_FILE else "нет",
@@ -144,11 +212,71 @@ async def main() -> None:
         await _run_polling(bot, dp)
 
 
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _start_watchdog(bot: Bot) -> None:
+    """Держим ссылку на задачу: event loop хранит только слабые ссылки."""
+    task = asyncio.create_task(_watchdog(bot))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+async def _watchdog(bot: Bot) -> None:
+    """Сторож доставки: раз в 5 минут смотрит, что Telegram не копит апдейты.
+
+    Render free засыпает после ~15 минут без входящих запросов. Если внешний
+    «будильник» перестал стучать, первый апдейт приходит с задержкой; а если
+    очередь начала расти или вебхук отвалился — переставляем его сами.
+    """
+    while True:
+        await asyncio.sleep(300)
+        try:
+            info = await bot.get_webhook_info()
+        except Exception as exc:  # noqa: BLE001 — сторож не должен падать
+            log.warning("сторож: get_webhook_info не ответил: %s", exc)
+            continue
+
+        err = info.last_error_message or ""
+        runtime.STATS["webhook_check"] = time.time()
+        runtime.STATS["webhook_pending"] = info.pending_update_count or 0
+        runtime.STATS["webhook_error"] = err
+        log.info(
+            "сторож: вебхук %s, в очереди %s, ошибка: %s",
+            info.url or "нет",
+            info.pending_update_count or 0,
+            err or "нет",
+        )
+
+        fresh_error = False
+        if err and info.last_error_date is not None:
+            try:
+                stamp = info.last_error_date.timestamp()
+            except AttributeError:
+                stamp = float(info.last_error_date)
+            fresh_error = time.time() - stamp < 1800
+
+        if not (fresh_error or not info.url) or not PUBLIC_URL:
+            continue
+        try:
+            await bot.set_webhook(
+                f"{PUBLIC_URL}{WEBHOOK_PATH}",
+                secret_token=WEBHOOK_SECRET or None,
+                drop_pending_updates=False,
+            )
+            log.warning("сторож: вебхук переставлен на %s", PUBLIC_URL)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("сторож: не удалось переставить вебхук: %s", exc)
+
+
 async def _run_polling(bot: Bot, dp: Dispatcher) -> None:
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        # drop_pending_updates=True терял сообщения, написанные во время
+        # перезапуска/холодного старта. Лучше доставить их с опозданием.
+        await bot.delete_webhook(drop_pending_updates=False)
     except TelegramNetworkError as exc:
         log.warning("не удалось снять вебхук: %s", exc)
+    _start_watchdog(bot)
     await dp.start_polling(bot)
 
 
@@ -162,9 +290,11 @@ async def _run_webhook(bot: Bot, dp: Dispatcher) -> None:
 
     # Вебхук ставим до старта сервера: если Telegram недоступен, контейнер
     # упадёт и хостинг перезапустит его, а не будет делать вид, что всё хорошо.
+    # drop_pending_updates=False: сообщения, написанные во время холодного
+    # старта Render, не выбрасываем — Telegram дошлёт их, когда поднимемся.
     for attempt in range(1, 4):
         try:
-            await bot.set_webhook(url, secret_token=secret, drop_pending_updates=True)
+            await bot.set_webhook(url, secret_token=secret, drop_pending_updates=False)
             log.info("Вебхук установлен: %s", url)
             break
         except TelegramNetworkError as exc:
@@ -182,16 +312,33 @@ async def _run_webhook(bot: Bot, dp: Dispatcher) -> None:
     async def health(_request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
+    async def status(_request: web.Request) -> web.Response:
+        """Для /ping из браузера и мониторинга: жив ли бот и когда был апдейт."""
+        return web.json_response(
+            {
+                "ok": True,
+                "build": BUILD,
+                "uptime": runtime.human_age(runtime.uptime()),
+                "updates": runtime.STATS["updates"],
+                "blocked": runtime.STATS["blocked"],
+                "last_update": runtime.last_update_text(),
+                "webhook_pending": runtime.STATS["webhook_pending"],
+                "webhook_error": runtime.STATS["webhook_error"],
+            }
+        )
+
     # Нужно и для проверок хостинга, и для «пингеров», которые не дают
     # бесплатному контейнеру заснуть
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    app.router.add_get("/status", status)
 
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info("HTTP-сервер слушает 0.0.0.0:%s", PORT)
+    _start_watchdog(bot)
 
     try:
         await asyncio.Event().wait()

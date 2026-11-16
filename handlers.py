@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import math
 import re
 import shutil
 import tempfile
@@ -29,8 +30,9 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import runtime
 import storage
-from config import DOWNLOADS_DIR, MAX_UPLOAD_MB
+from config import BUILD, DOWNLOADS_DIR, MAX_UPLOAD_MB, OWNER_IDS
 from downloader import (
     AUDIO_EXTS,
     SEMAPHORE as _semaphore,
@@ -40,8 +42,10 @@ from downloader import (
     cobalt_services_report,
     download_audio,
     download_media,
+    download_x,
     fa_diagnose,
     is_music_link,
+    is_x,
     is_youtube,
     resolve_music_link_detailed,
     search,
@@ -75,6 +79,8 @@ START_TEXT = (
     "📥 <b>Медиа по ссылке</b> — кинь ссылку на YouTube, TikTok, VK, Twitter/X, "
     "Instagram, Reddit, Rutube, Vimeo, SoundCloud, Pinterest, FurAffinity и "
     "многое другое — пришлю файл.\n\n"
+    "🖼 <b>Посты X с фото</b> — до 20 картинок: можно склеить их в сетку, "
+    "собрать в одну ленту (если работа разрезана на панели) или скачать все.\n\n"
     "💬 <b>В любом чате</b> — набери <code>@имя_бота</code> и ссылку или название трека, "
     "не добавляя меня в чат.\n\n"
     "🧩 <b>Сервисы</b> — кнопка ниже покажет всё, что умеет бот: какие сайты "
@@ -96,12 +102,17 @@ HELP_TEXT = (
     "• <code>https://vk.ru/video...</code> или <code>vk.ru/wall...</code> — видео из VK\n"
     "• <code>https://www.furaffinity.net/view/12345678/</code> — картинка с FurAffinity\n"
     "• <code>@имя_бота https://tiktok.com/...</code> — прямо в любом чате\n"
+    "• <code>https://x.com/…/status/…</code> — до 20 фото и видео поста, "
+    "с кнопками «сетка»/«лента»/«все фото»\n"
     "• <code>/services</code> или кнопка «🧩 Сервисы» — все доступные сервисы\n"
     "• <code>/settings</code> или кнопка «⚙️ Настройки» — «как файл»/«обычно» "
     "и ссылка на источник\n"
+    "• <code>/ping</code> — жив ли бот и доходят ли сообщения\n"
+    "• <code>/id</code> — ваш Telegram ID (для приватного режима)\n"
     "• <code>/yt_debug https://youtu.be/...</code> — почему YouTube не качается\n\n"
-    "YouTube качается напрямую (yt-dlp + cookies из COOKIES_FILE). Остальные\n"
-    "сервисы сначала идут через cobalt, а если он не справился — через yt-dlp.\n"
+    "YouTube качается напрямую (yt-dlp + cookies из COOKIES_FILE). VK и X —\n"
+    "своим путём (без cobalt). Остальные сервисы сначала идут через cobalt, а\n"
+    "если он не справился — через yt-dlp.\n"
     "Если сервис просит вход, добавьте COBALT_API (свой cobalt) или cookies.\n"
     "Ссылки на посты Telegram не поддерживаются: для них нужен юзербот.\n\n"
     "Если скачивание затянулось, под сообщением появится «⏹ Остановить» — "
@@ -118,6 +129,52 @@ class SearchSession:
 
 
 _sessions: dict[str, SearchSession] = {}
+
+
+@dataclass
+class XPost:
+    """Скачанный пост X: файлы лежат в своей папке, пока пользователь выбирает."""
+
+    user_id: int
+    url: str
+    folder: Path
+    files: list[Path]
+    info: dict
+    created_at: float
+
+
+X_POST_TTL = 60 * 60  # час на выбор «склеить» / «все фото»
+_x_posts: dict[str, XPost] = {}
+_x_busy: set[str] = set()
+
+
+def _gc_x_posts() -> None:
+    now = time.time()
+    for token, post in list(_x_posts.items()):
+        if now - post.created_at > X_POST_TTL:
+            _drop_x_post(token)
+
+
+def _new_x_post(user_id: int, url: str, folder: Path, files: list[Path], info: dict) -> str:
+    _gc_x_posts()
+    token = uuid.uuid4().hex[:10]
+    _x_posts[token] = XPost(
+        user_id=user_id,
+        url=url,
+        folder=folder,
+        files=files,
+        info=info,
+        created_at=time.time(),
+    )
+    return token
+
+
+def _drop_x_post(token: str) -> None:
+    post = _x_posts.pop(token, None)
+    _x_busy.discard(token)
+    if post is not None:
+        shutil.rmtree(post.folder, ignore_errors=True)
+
 
 
 # ---------------------------------------------------------------- утилиты
@@ -497,6 +554,73 @@ async def cmd_start(message: Message) -> None:
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT)
+
+
+@router.message(Command("id"))
+async def cmd_id(message: Message) -> None:
+    """Показывает Telegram ID: его нужно вписать в OWNER_IDS."""
+    user = message.from_user
+    uid = user.id if user else 0
+    lines = [f"🪪 Ваш Telegram ID: <code>{uid}</code>"]
+    if not OWNER_IDS:
+        lines.append(
+            "\nЧтобы ботом пользовались только вы: Render → Environment → "
+            f"добавить <code>OWNER_IDS={uid}</code> → Save → перезапуск."
+        )
+    elif uid in OWNER_IDS:
+        lines.append("\n✅ Вы в списке OWNER_IDS — бот пускает только вас.")
+    else:
+        lines.append("\n⚠️ Вас нет в OWNER_IDS — бот вас не пустит.")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("ping"))
+async def cmd_ping(message: Message) -> None:
+    """Жив ли бот, доходят ли апдейты и не копит ли их Telegram."""
+    _gc_x_posts()
+    stats = runtime.STATS
+    lines = [
+        "🫀 <b>Пинг</b>",
+        f"Сборка: <code>{BUILD}</code>",
+        f"Аптайм: <b>{runtime.human_age(runtime.uptime())}</b> "
+        f"(старт {runtime.started_text()})",
+        f"Последний апдейт: <b>{runtime.last_update_text()}</b>",
+        f"Апдейтов: {stats['updates']} (сообщений {stats['messages']}, "
+        f"кнопок {stats['callbacks']}, inline {stats['inline']}), "
+        f"отказов по доступу: {stats['blocked']}",
+        "",
+    ]
+    try:
+        info = await message.bot.get_webhook_info()
+        lines.append(
+            f"Вебхук: <code>{html.escape(info.url)}</code>"
+            if info.url
+            else "Вебхук: не задан (long polling)"
+        )
+        lines.append(f"В очереди Telegram: {info.pending_update_count or 0}")
+        if info.last_error_message:
+            when = ""
+            if info.last_error_date is not None:
+                try:
+                    when = f" ({runtime.human_age(time.time() - info.last_error_date.timestamp())} назад)"
+                except AttributeError:
+                    when = ""
+            lines.append(
+                f"⚠️ Последняя ошибка доставки{when}: "
+                f"{html.escape(str(info.last_error_message)[:200])}"
+            )
+        else:
+            lines.append("Ошибок доставки нет.")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"Вебхук: не удалось узнать ({html.escape(str(exc)[:120])})")
+
+    lines.append("")
+    lines.append(
+        "<i>Render free засыпает через ~15 минут без входящих запросов. "
+        "Внешний пингер должен открывать /health каждые 5–10 минут; "
+        "после сна первый ответ бывает с задержкой до минуты.</i>"
+    )
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("services"))
@@ -942,6 +1066,344 @@ async def _fa_preview(status: Message, url: str, detail: str) -> None:
     await _cleanup_notice(status, text)
 
 
+# ---------------------------------------------------------------- X (Twitter)
+
+
+X_COLLAGE_MAX = 20
+
+
+def _x_menu_kb(token: str, photos: int, videos: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    if photos >= 2:
+        kb.row(
+            InlineKeyboardButton(
+                text=(
+                    "🖼 Склеить все фото в одно"
+                    if photos == 2
+                    else f"🖼 Склеить в сетку ({photos})"
+                ),
+                callback_data=f"xp:{token}:col",
+            )
+        )
+    if photos >= 3:
+        kb.row(
+            InlineKeyboardButton(
+                text=f"➡️ Склеить в ленту ({photos})",
+                callback_data=f"xp:{token}:row",
+            )
+        )
+    if photos:
+        kb.row(
+            InlineKeyboardButton(
+                text=f"📎 Скачать все фото ({photos})",
+                callback_data=f"xp:{token}:all",
+            )
+        )
+    if videos:
+        kb.row(
+            InlineKeyboardButton(
+                text=f"🎬 Скачать видео ({videos})",
+                callback_data=f"xp:{token}:vid",
+            )
+        )
+    kb.row(InlineKeyboardButton(text="✖️ Закрыть", callback_data=f"xp:{token}:close"))
+    return kb.as_markup()
+
+
+def _collage_sync(files: list[Path], dest: Path, layout: str = "grid") -> Path:
+    """Склеивает до 20 фото: сеткой или одной лентой (Pillow, в потоке).
+
+    «Сетка» — компактный коллаж (до 5 колонок). «Лента» — все картинки в один
+    ряд: так собирают работу, которую автор разрезал на панели для поста X.
+    """
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:  # noqa: F841
+        raise DownloadError(
+            "Для склейки нужен Pillow — в образе он ставится из requirements.txt."
+        ) from None
+
+    files = files[:X_COLLAGE_MAX]
+    planned = len(files)
+    cell = 1000 if planned <= 4 else 800 if planned <= 9 else 680
+    if layout == "row":
+        # лента не должна вылезти за 10 000 px: шире Telegram не примет фото
+        cell = min(
+            cell, max(320, (10_000 - 12 * max(0, planned - 1)) // max(1, planned))
+        )
+
+    images = []
+    for file in files:
+        try:
+            with Image.open(file) as src:
+                img = ImageOps.exif_transpose(src).convert("RGB")
+                img.thumbnail((cell, cell), Image.LANCZOS)
+                images.append(img.copy())
+        except Exception as exc:  # noqa: BLE001 — одно битое фото не отменяет всё
+            log.warning("склейка: пропускаю %s (%s)", file, exc)
+    if not images:
+        raise DownloadError("Не удалось прочитать картинки для склейки.")
+
+    count = len(images)
+    gap = 12
+    if layout == "row":
+        row_height = max(img.height for img in images)
+        width = sum(img.width for img in images) + gap * (count - 1)
+        canvas = Image.new("RGB", (max(1, width), row_height), (255, 255, 255))
+        x = 0
+        for img in images:
+            canvas.paste(img, (x, (row_height - img.height) // 2))
+            x += img.width + gap
+    else:
+        cols = 1 if count == 1 else min(5, math.ceil(math.sqrt(count)))
+        rows = math.ceil(count / cols)
+        canvas = Image.new(
+            "RGB",
+            (cols * cell + (cols - 1) * gap, rows * cell + (rows - 1) * gap),
+            (255, 255, 255),
+        )
+        for index, img in enumerate(images):
+            col, row = index % cols, index // cols
+            x = col * (cell + gap) + (cell - img.width) // 2
+            y = row * (cell + gap) + (cell - img.height) // 2
+            canvas.paste(img, (x, y))
+
+    # держим файл в пределах лимита фото Telegram (10 МБ): сначала качество,
+    # потом уже размер полотна
+    limit = 9 * 1024 * 1024
+    quality = 88
+    canvas.save(dest, "JPEG", quality=quality, optimize=True, progressive=True)
+    while dest.stat().st_size > limit and quality > 72:
+        quality -= 6
+        canvas.save(dest, "JPEG", quality=quality, optimize=True, progressive=True)
+    while dest.stat().st_size > limit and canvas.width > 1200:
+        canvas = canvas.resize(
+            (int(canvas.width * 0.8), int(canvas.height * 0.8)), Image.LANCZOS
+        )
+        canvas.save(dest, "JPEG", quality=82, optimize=True, progressive=True)
+    return dest
+
+
+def _x_caption(post: "XPost", keep_source: bool) -> str:
+    if not keep_source:
+        return ""
+    return f'<a href="{html.escape(post.url)}">ссылка на источник</a>'
+
+
+async def _send_photos(
+    status: Message, images: list[Path], caption: str, as_file: bool
+) -> None:
+    """Все фото поста: альбомами по 10 (или документами при «как файл»)."""
+    used_caption = False
+    pending = list(images)
+
+    if not as_file:
+        # у фото в Telegram лимит 10 МБ, у документа — 50: крупные шлём файлом
+        big = [p for p in pending if p.stat().st_size > 9 * 1024 * 1024]
+        if big:
+            pending = [p for p in pending if p not in big]
+            for path in big:
+                await status.answer_document(
+                    document=FSInputFile(path, filename=safe_filename(path.stem, path.suffix)),
+                    caption=None if used_caption else caption,
+                )
+                used_caption = True
+
+    for start in range(0, len(pending), 10):
+        chunk = pending[start : start + 10]
+        chunk_caption = None if used_caption else caption
+        if as_file:
+            for index, path in enumerate(chunk):
+                await status.answer_document(
+                    document=FSInputFile(path, filename=safe_filename(path.stem, path.suffix)),
+                    caption=chunk_caption if index == 0 else None,
+                )
+            used_caption = True
+            continue
+        if len(chunk) == 1:
+            await status.answer_photo(
+                photo=FSInputFile(chunk[0], filename=safe_filename(chunk[0].stem, chunk[0].suffix)),
+                caption=chunk_caption,
+            )
+            used_caption = True
+            continue
+        await status.answer_media_group(
+            [
+                InputMediaPhoto(
+                    media=FSInputFile(p, filename=safe_filename(p.stem, p.suffix)),
+                    caption=chunk_caption if index == 0 else None,
+                )
+                for index, p in enumerate(chunk)
+            ]
+        )
+        used_caption = True
+
+
+async def handle_x(message: Message, url: str) -> None:
+    """Пост X: качаем всё и предлагаем «склеить фото» или «скачать все»."""
+    status = await message.answer("⬇️ Скачиваю пост X…")
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(dir=DOWNLOADS_DIR))
+    progress = ProgressBar(status, "⬇️ Скачиваю пост X…")
+    token, cancel = _start_job()
+    stop_task = asyncio.create_task(_show_stop_button(status, token, progress))
+    keep = False
+    user_id = message.from_user.id if message.from_user else None
+    try:
+        try:
+            async with _semaphore:
+                files, info = await asyncio.wait_for(
+                    download_x(url, tmp_dir, on_progress=progress.update, cancel=cancel),
+                    timeout=300,
+                )
+        except DownloadCancelled:
+            await _cleanup_notice(status, "⏹ Остановлено.")
+            return
+        except DownloadError as exc:
+            await _cleanup_notice(status, f"❌ {html.escape(str(exc))}")
+            return
+        except asyncio.TimeoutError:
+            await _cleanup_notice(status, "❌ X отвечал слишком долго. Попробуйте ещё раз.")
+            return
+        except Exception:  # noqa: BLE001
+            log.exception("X download failed: %s", url)
+            await _cleanup_notice(status, "❌ Не получилось скачать пост X.")
+            return
+        finally:
+            await progress.stop()
+
+        images = [p for p in files if p.suffix.lower() in IMAGE_EXTS]
+        videos = [p for p in files if p.suffix.lower() in VIDEO_EXTS]
+
+        if len(files) == 1:
+            path = files[0]
+            size_mb = path.stat().st_size / (1024 * 1024)
+            if size_mb > MAX_UPLOAD_MB:
+                await _cleanup_notice(
+                    status,
+                    f"❌ Файл {size_mb:.0f} МБ — больше лимита Telegram "
+                    f"({MAX_UPLOAD_MB} МБ).",
+                )
+                return
+            await deliver(
+                status,
+                path,
+                info,
+                url,
+                storage.normalize_url(url),
+                user_id=user_id,
+            )
+            return
+
+        xid = _new_x_post(user_id or 0, url, tmp_dir, files, info)
+        keep = True
+        title = " ".join(str(info.get("title") or "").split())[:160]
+        counts = f"Фото: <b>{len(images)}</b>"
+        if videos:
+            counts += f", видео: <b>{len(videos)}</b>"
+        body = "🖼 <b>Пост X скачан</b>\n"
+        if title:
+            body += f"<i>{html.escape(title)}</i>\n"
+        body += f"{counts}\n\nСклеить в сетку или в ленту, или скачать по отдельности?"
+        try:
+            await status.edit_text(
+                body, reply_markup=_x_menu_kb(xid, len(images), len(videos))
+            )
+        except Exception:  # noqa: BLE001
+            await message.answer(
+                body, reply_markup=_x_menu_kb(xid, len(images), len(videos))
+            )
+    finally:
+        stop_task.cancel()
+        _finish_job(token)
+        if not keep:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@router.callback_query(F.data.startswith("xp:"))
+async def cb_x_post(callback: CallbackQuery) -> None:
+    """Меню под постом X: склейка, все фото, видео, закрыть."""
+    try:
+        _, token, action = (callback.data or "").split(":", 2)
+    except ValueError:
+        await callback.answer()
+        return
+
+    post = _x_posts.get(token)
+    user_id = callback.from_user.id if callback.from_user else 0
+    if not post or post.user_id != user_id:
+        await callback.answer("Меню устарело — пришлите ссылку заново.", show_alert=True)
+        return
+
+    status = callback.message
+    if action == "close":
+        if status is not None:
+            try:
+                await status.delete()
+            except Exception:  # noqa: BLE001
+                pass
+        _drop_x_post(token)
+        await callback.answer()
+        return
+
+    if token in _x_busy:
+        await callback.answer("Уже отправляю…")
+        return
+
+    _x_busy.add(token)
+    await callback.answer("Отправляю…")
+    settings = storage.get_settings(post.user_id)
+    images = [p for p in post.files if p.suffix.lower() in IMAGE_EXTS]
+    videos = [p for p in post.files if p.suffix.lower() in VIDEO_EXTS]
+    caption = _x_caption(post, settings["keep_source"])
+
+    try:
+        if status is None:
+            return
+        if action in {"col", "row"}:
+            layout = "row" if action == "row" else "grid"
+            dest = post.folder / f"collage_{layout}.jpg"
+            try:
+                await asyncio.to_thread(_collage_sync, images, dest, layout)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("X: склейка не удалась")
+                await status.answer(f"❌ Не получилось склеить: {html.escape(str(exc)[:160])}")
+                return
+            sent = await _send_new(
+                status,
+                dest,
+                caption,
+                "Коллаж",
+                post.info.get("uploader") or "",
+                None,
+                settings["send_as_file"],
+            )
+            _remember(sent, f"{storage.normalize_url(post.url)}#collage", "Коллаж")
+        else:
+            if action == "all" and images:
+                await _send_photos(status, images, caption, settings["send_as_file"])
+            if action in {"all", "vid"} and videos:
+                for index, path in enumerate(videos):
+                    await status.answer_video(
+                        video=FSInputFile(path, filename=safe_filename(path.stem, path.suffix)),
+                        caption=caption if index == 0 else None,
+                        supports_streaming=True,
+                    )
+        try:
+            await status.edit_text("✅ Готово.")
+        except Exception:  # noqa: BLE001 — сообщение могли удалить
+            pass
+    except Exception:  # noqa: BLE001
+        log.exception("X: не удалось отправить файлы поста")
+        if status is not None:
+            try:
+                await status.answer("❌ Не получилось отправить файлы — пришлите ссылку заново.")
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        _drop_x_post(token)
+
+
 async def handle_link(message: Message, url: str) -> None:
     if any(host in url for host in ("t.me/", "telegram.me/", "telegram.dog/")):
         await message.answer(
@@ -949,6 +1411,11 @@ async def handle_link(message: Message, url: str) -> None:
             "с доступом к аккаунту, а это отдельная история.\n"
             "Пришлите прямую ссылку на видео (TikTok, VK, X и т.д.)."
         )
+        return
+
+    # X: свой путь — посты с несколькими фото получают меню «склеить/все»
+    if is_x(url):
+        await handle_x(message, url)
         return
 
     status = await message.answer("⬇️ Скачиваю…")

@@ -52,6 +52,10 @@ X_STATUS_RE = re.compile(
     r"https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{1,30})/status/(\d+)"
 )
 
+# X разрешает до 20 картинок в посте, и из них часто склеивают одну работу.
+X_PHOTO_LIMIT = 20
+X_VIDEO_LIMIT = 4
+
 # общий лимит одновременных скачиваний (и в личке, и в inline)
 SEMAPHORE = asyncio.Semaphore(3)
 
@@ -2804,14 +2808,15 @@ def _cobalt_services() -> set[str]:
 
     ``all``/``*`` — все сервисы, которые умеет cobalt, кроме YouTube.
     ``none``/``off`` — не отдавать в cobalt ничего (только yt-dlp).
+    VK и X всегда качаются своим путём, даже если указаны явно.
     """
     raw = (COBALT_SERVICES or "").replace("\\n", ",")
     items = {chunk.strip().lower() for chunk in raw.split(",") if chunk.strip()}
     if not items or items & {"none", "off", "0", "no"}:
         return set()
     if items & {"all", "*"}:
-        return {name for name in _COBALT_HOSTS if name != "youtube"}
-    return items
+        items = {name for name in _COBALT_HOSTS if name != "youtube"}
+    return items - COBALT_NATIVE_SERVICES
 
 
 def _cobalt_service(url: str) -> str | None:
@@ -2827,6 +2832,9 @@ def _cobalt_service(url: str) -> str | None:
             # COOKIES_FILE надёжнее, чем заведомо неудачный запрос в cobalt.
             if not COBALT_YOUTUBE:
                 continue
+        elif name in COBALT_NATIVE_SERVICES:
+            # VK и X — только своим путём, cobalt их не трогает.
+            continue
         elif name not in enabled:
             continue
         if any(host == domain or host.endswith("." + domain) for domain in domains):
@@ -2868,7 +2876,13 @@ _COBALT_LABELS = {
 
 # cobalt в списке сервисов пишет «twitch clips», а в запросах — «twitch».
 _COBALT_ALIASES = {"twitch clips": "twitch", "twitchclips": "twitch"}
-_COBALT_FALLBACK_SERVICES = [name for name in _COBALT_HOSTS if name != "youtube"]
+# VK и X качаем только своим путём: у VK это фото/посты с cookies, у X —
+# картинки и альбомы, которых cobalt не отдаёт. Даже если их явно перечислить
+# в COBALT_SERVICES, в cobalt они не уйдут.
+COBALT_NATIVE_SERVICES = frozenset({"vk", "twitter"})
+_COBALT_FALLBACK_SERVICES = [
+    name for name in _COBALT_HOSTS if name != "youtube"
+]
 
 
 def _cobalt_key(name: str) -> str:
@@ -2929,6 +2943,10 @@ def cobalt_services_report() -> str:
         lines.append("▶️ YouTube тоже отдаётся в cobalt (COBALT_YOUTUBE=1).")
     else:
         lines.append("▶️ YouTube качается напрямую: yt-dlp + cookies.")
+    lines.append(
+        "🧩 Своим путём (без cobalt): <b>VK</b> (фото/посты + VK_COOKIE) "
+        "и <b>X (Twitter)</b> (все фото поста, склейка)."
+    )
     lines.append("")
 
     lines.append(f"Доступно у инстанса: <b>{len(services)}</b>")
@@ -2937,7 +2955,10 @@ def cobalt_services_report() -> str:
             "<i>COBALT_API не задан — показан встроенный список сервисов.</i>"
         )
     for name in services:
-        mark = "✅" if name in enabled else "▫️"
+        if name in COBALT_NATIVE_SERVICES:
+            mark = "🧩"
+        else:
+            mark = "✅" if name in enabled else "▫️"
         label = _COBALT_LABELS.get(name, name.title())
         lines.append(f"{mark} {html.escape(label)}")
     lines.append("")
@@ -2952,7 +2973,7 @@ def cobalt_services_report() -> str:
 
     lines.append(
         "<i>✅ — бот отдаёт ссылку в cobalt, ▫️ — качает своим путём "
-        "(yt-dlp или собственный разбор).</i>"
+        "(yt-dlp или собственный разбор), 🧩 — всегда своим путём.</i>"
     )
     return "\n".join(lines)
 
@@ -3647,26 +3668,140 @@ def _guess_ext(url: str) -> str:
     return ".mp4" if "video" in urlsplit(url).netloc else ".jpg"
 
 
+# ---------------------------------------------------------------- X (Twitter)
+# yt-dlp из X умеет только видео, а картинки в постах — нет. Поэтому X всегда
+# качаем своим путём: публичные JSON-зеркала отдают и фото, и mp4, без входа.
+
+
+def _x_host(url: str) -> str:
+    host = (urlsplit(url).netloc or "").lower()
+    for prefix in ("www.", "mobile.", "m."):
+        if host.startswith(prefix):
+            host = host[len(prefix) :]
+    return host
+
+
+def is_x(url: str) -> bool:
+    host = _x_host(url)
+    return host in {"x.com", "twitter.com"} or host.endswith(".twitter.com")
+
+
+def _x_photo_orig(url: str) -> str:
+    """pbs.twimg.com/media/...?name=small → оригинал (name=orig)."""
+    parts = urlsplit(url)
+    if "twimg.com" not in (parts.netloc or ""):
+        return url
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    if not any(key == "name" for key, _ in query):
+        return url
+    query = [(key, "orig") if key == "name" else (key, value) for key, value in query]
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            urllib.parse.urlencode(query),
+            parts.fragment,
+        )
+    )
+
+
+def _x_pick_video(variants: list | None) -> str | None:
+    """Самый качественный прямой mp4 из video_info.variants."""
+    best: tuple[int, str] | None = None
+    for variant in variants or []:
+        if not isinstance(variant, dict):
+            continue
+        url = str(variant.get("url") or "")
+        kind = str(variant.get("content_type") or "video/mp4")
+        if not url or "mp4" not in kind:
+            continue
+        bitrate = int(variant.get("bitrate") or 0)
+        if best is None or bitrate > best[0]:
+            best = (bitrate, url)
+    return best[1] if best else None
+
+
 def _x_tweet_json(user: str, status_id: str) -> dict | None:
-    """Публичный API без ключей: fxtwitter, запасной — vxtwitter."""
+    """Публичный API без ключей: fxtwitter → vxtwitter → syndication."""
     for api in (
         f"https://api.fxtwitter.com/{user}/status/{status_id}",
         f"https://api.vxtwitter.com/{user}/status/{status_id}",
+        f"https://cdn.syndication.twimg.com/tweet-result?id={status_id}&lang=en&token=a",
     ):
         try:
             data = json.loads(_http_get(api))
         except Exception as exc:  # noqa: BLE001
             log.debug("X API недоступен (%s): %s", api, exc)
             continue
-        if isinstance(data, dict):
-            tweet = data.get("tweet") if isinstance(data.get("tweet"), dict) else data
-            if tweet:
-                return tweet
+        if not isinstance(data, dict):
+            continue
+        tweet = data.get("tweet") if isinstance(data.get("tweet"), dict) else data
+        if not isinstance(tweet, dict):
+            continue
+        if tweet.get("media") or tweet.get("mediaDetails") or tweet.get("mediaURLs"):
+            tweet["_source"] = api
+            return tweet
     return None
 
 
-def _x_media_sync(url: str, out_dir: Path) -> tuple[Path, dict] | None:
-    """Картинки (и видео) из поста X — то, что yt-dlp качать не умеет."""
+def _x_media_urls(tweet: dict) -> tuple[list[str], list[str]]:
+    """Все фото и видео поста в одном порядке: (photos, videos)."""
+    photos: list[str] = []
+    videos: list[str] = []
+
+    def add_photo(raw: str) -> None:
+        url = _x_photo_orig(str(raw or "").strip())
+        if url and url not in photos:
+            photos.append(url)
+
+    def add_video(raw: str) -> None:
+        url = str(raw or "").strip()
+        if url and url not in videos:
+            videos.append(url)
+
+    media = tweet.get("media") or {}
+    if isinstance(media, dict):
+        for photo in media.get("photos") or []:
+            if isinstance(photo, dict):
+                add_photo(photo.get("url") or photo.get("media_url_https") or "")
+        for video in media.get("videos") or []:
+            if isinstance(video, dict):
+                add_video(video.get("url") or "")
+
+    for detail in tweet.get("mediaDetails") or []:  # cdn.syndication
+        if not isinstance(detail, dict):
+            continue
+        kind = str(detail.get("type") or "").lower()
+        if kind == "photo":
+            add_photo(detail.get("media_url_https") or "")
+        elif kind in {"video", "animated_gif"}:
+            add_video(
+                _x_pick_video((detail.get("video_info") or {}).get("variants")) or ""
+            )
+
+    for item in tweet.get("mediaURLs") or []:  # vxtwitter
+        if not isinstance(item, str):
+            continue
+        low = item.lower()
+        if "pbs.twimg.com" in low or low.split("?")[0].endswith(
+            (".jpg", ".jpeg", ".png", ".webp")
+        ):
+            add_photo(item)
+        else:
+            add_video(item)
+
+    return photos, videos
+
+
+def x_media_sync(
+    url: str,
+    out_dir: Path,
+    cancel=None,
+    limit: int = X_PHOTO_LIMIT,
+    videos_limit: int = X_VIDEO_LIMIT,
+) -> tuple[list[Path], dict] | None:
+    """Скачивает ВСЕ фото и видео поста X. None — если API ничего не отдал."""
     match = X_STATUS_RE.search(url)
     if not match:
         return None
@@ -3676,44 +3811,86 @@ def _x_media_sync(url: str, out_dir: Path) -> tuple[Path, dict] | None:
     if not tweet:
         return None
 
-    media = tweet.get("media") or {}
-    urls: list[str] = []
-    for photo in media.get("photos") or []:
-        if photo.get("url"):
-            urls.append(photo["url"])
-    for video in media.get("videos") or []:
-        if video.get("url"):
-            urls.append(video["url"])
-    for item in tweet.get("mediaURLs") or []:  # формат vxtwitter
-        if isinstance(item, str) and item not in urls:
-            urls.append(item)
-
+    photos, videos = _x_media_urls(tweet)
+    photos, videos = photos[:limit], videos[:videos_limit]
+    urls = photos + videos
     if not urls:
         return None
 
-    text = " ".join((tweet.get("text") or "").split())
-    author = (tweet.get("author") or {}).get("name") or tweet.get("user_name") or f"@{user}"
+    text = " ".join(str(tweet.get("text") or "").split())
+    author = tweet.get("author") if isinstance(tweet.get("author"), dict) else {}
+    author_name = (
+        str(author.get("name") or "")
+        or str(tweet.get("user_name") or "")
+        or f"@{user}"
+    )
     budget = MAX_UPLOAD_MB * 1024 * 1024
+    files: list[Path] = []
 
-    for media_url in urls:
+    def fetch(media_url: str) -> bytes:
+        """name=orig есть не у всех картинок — пробуем соседние размеры."""
+        candidates = [media_url]
+        if "name=orig" in media_url:
+            candidates += [
+                media_url.replace("name=orig", "name=large"),
+                media_url.replace("name=orig", "name=small"),
+                media_url.split("?")[0],
+            ]
+        last: Exception | None = None
+        for candidate in candidates:
+            try:
+                return _http_get(candidate, timeout=120)
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+        raise last or RuntimeError("нет данных")
+
+    for index, media_url in enumerate(urls, start=1):
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled()
         try:
-            data = _http_get(media_url, timeout=60)
-        except Exception as exc:  # noqa: BLE001
+            data = fetch(media_url)
+        except Exception as exc:  # noqa: BLE001 — одно битое фото не валит пост
             log.warning("X: не скачалось %s: %s", media_url, exc)
             continue
         if len(data) > budget:
-            log.info("X: файл больше лимита (%s байт), пробуем следующий", len(data))
+            log.info("X: файл больше лимита (%s байт), пропускаю", len(data))
             continue
-
-        path = out_dir / f"{status_id}{_guess_ext(media_url)}"
+        path = out_dir / f"{status_id}_{index}{_guess_ext(media_url)}"
         path.write_bytes(data)
-        return path, {
-            "title": text[:120] or f"Пост @{user}",
-            "uploader": author,
-            "duration": 0,
-        }
+        files.append(path)
 
-    return None
+    if not files:
+        return None
+
+    return files, {
+        "title": text[:120] or f"Пост @{user}",
+        "uploader": author_name,
+        "duration": 0,
+        "x_photos": len(photos),
+        "x_videos": len(videos),
+        "x_text": text,
+    }
+
+
+def _x_media_sync(url: str, out_dir: Path) -> tuple[Path, dict] | None:
+    """Первый файл поста — для обычного пути (inline и одиночная доставка)."""
+    result = x_media_sync(url, out_dir)
+    if not result:
+        return None
+    files, info = result
+    return files[0], info
+
+
+async def download_x(
+    url: str, out_dir: Path, on_progress=None, cancel=None
+) -> tuple[list[Path], dict]:
+    """Все медиа поста X. Если зеркала недоступны — падаем в обычный yt-dlp."""
+    result = await asyncio.to_thread(x_media_sync, url, out_dir, cancel)
+    if result:
+        return result
+    log.info("X: зеркала ничего не отдали, пробую yt-dlp: %s", url)
+    path, info = await download_media(url, out_dir, on_progress=on_progress, cancel=cancel)
+    return [path], info
 
 
 # ---------------------------------------------------------------- FurAffinity
@@ -4902,6 +5079,20 @@ def _download_media_sync(
         ext = Path(urlsplit(url).path).suffix.lower()
         if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
             return _vk_download_direct("photo", url, out_dir)
+
+    # X: свой разбор (фото + видео; cobalt для X не используем). Если зеркала
+    # молчат — ниже сработает обычный yt-dlp.
+    if is_x(url):
+        try:
+            x_result = x_media_sync(url, out_dir, cancel)
+        except DownloadCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("X: свой разбор не удался (%s), пробую yt-dlp", exc)
+            x_result = None
+        if x_result:
+            x_files, x_info = x_result
+            return x_files[0], x_info
 
     # Reddit: свой путь через публичный Atom-фид (JSON и yt-dlp требуют вход).
     reddit_error: DownloadError | None = None

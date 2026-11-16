@@ -12,6 +12,8 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: OWNER_IDS
+        sync: false
       - key: MAX_UPLOAD_MB
         value: "49"
       - key: COBALT_SERVICES

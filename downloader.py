@@ -39,6 +39,7 @@ from config import (
     POT_SERVER,
     PROXY,
     VK_COOKIE,
+    VK_TOKEN,
     YT_PLAYER_CLIENT,
     YT_PROXY,
     writable_cookie_copy,
@@ -108,6 +109,21 @@ _ZV_DUR_RE = re.compile(r'data-duration="(\d+)"')
 _ZV_ARTIST_RE = re.compile(r'<span class="cartist">(.*?)</span>', re.S)
 _ZV_TITLE_RE = re.compile(r'<span class="ctitle">(.*?)</span>', re.S)
 _ZV_SONG_ID_RE = re.compile(r"zvyki\.com/song/(\d+)")
+
+# Zvyki не индексирует кириллицу: «серёга пират» → 404, а «serega pirat»
+# находит те же треки. Таблица простая, без ГОСТа — задачи перевести текст нет.
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def _translit(text: str) -> str:
+    """Кириллица → латиница; остальные символы не трогаем."""
+    return "".join(_TRANSLIT.get(ch, ch) for ch in text.lower())
 
 
 class DownloadError(Exception):
@@ -757,12 +773,11 @@ VK_WALL_RE = re.compile(r"/wall(-?\d+)_(\d+)", re.I)
 VK_CHARSET_RE = re.compile(rb"charset=[\"']?([\w-]+)", re.I)
 VK_PAGE_LOCKED = (
     "VK не отдал пост: сообщество закрытое, пост скрыт или VK не принял куки.\n"
-    "Проверьте /vk_debug <ссылка>.\n"
-    "«сессия … НЕ принял куки» — сессия протухла: скопируйте Cookie из запроса\n"
-    "к vk.com заново (целиком) и убедитесь, что vk.com/feed в браузере\n"
-    "открывает вашу ленту, а не страницу входа.\n"
-    "«принял куки», но фото: 0 — аккаунт не видит эту стену (нет подписки\n"
-    "или не подтверждён возраст)."
+    "Самый надёжный путь — VK_TOKEN (vkhost.github.io, права «стена»): токен\n"
+    "не зависит от браузерной сессии и IP. Проверьте /vk_debug <ссылка>.\n"
+    "С куками: «сессия … НЕ принял куки» — сессия протухла или VK не пускает\n"
+    "её с сервера; «принял куки», но фото: 0 — аккаунт не видит эту стену\n"
+    "(нет подписки или не подтверждён возраст)."
 )
 
 
@@ -882,6 +897,59 @@ def _vk_page_photos(body: str) -> tuple[list[str], str]:
     return photos, " ".join(title.split())
 
 
+def _vk_api_wall_photos(owner_id: str, post_id: str) -> tuple[list[str], str]:
+    """Фото поста через wall.getById по VK_TOKEN: без браузерной сессии.
+
+    VK проверяет веб-сессию по отпечатку и IP, поэтому куки, снятые из
+    браузера, с сервера часто отбиваются (`validate_result=-2`). Токен от
+    приложения такой проверки не проходит — с ним пост читается с любого IP.
+    """
+    if not VK_TOKEN:
+        return [], ""
+    params = urllib.parse.urlencode(
+        {"posts": f"{owner_id}_{post_id}", "access_token": VK_TOKEN, "v": "5.199"}
+    )
+    request = urllib.request.Request(
+        f"https://api.vk.com/method/wall.getById?{params}",
+        headers={"User-Agent": VK_BROWSER_UA, "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        raise DownloadError(f"VK API: HTTP {exc.code}") from exc
+
+    error = payload.get("error") or {}
+    if error:
+        raise DownloadError(
+            "VK API: "
+            + str(error.get("error_msg") or error.get("error_code") or "ошибка")
+        )
+    posts = payload.get("response") or []
+    if isinstance(posts, dict):
+        posts = posts.get("items") or []
+    if not posts:
+        return [], ""
+
+    post = posts[0] if isinstance(posts[0], dict) else {}
+    attachments = list(post.get("attachments") or [])
+    # репост: вложения лежат в copy_history
+    for history in post.get("copy_history") or []:
+        attachments.extend(history.get("attachments") or [])
+
+    photos: list[str] = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        if str(attachment.get("type") or "").lower() != "photo":
+            continue
+        url = _vk_best_photo(attachment.get("photo") or {})
+        if url and url not in photos:
+            photos.append(url)
+    caption = " ".join(str(post.get("text") or "").split())
+    return photos, caption
+
+
 def _vk_mirror_url(url: str) -> str:
     """Тот же пост на зеркале: vk.com ⇄ vk.ru (сессии у домены могут различаться)."""
     parts = urlsplit(url)
@@ -908,6 +976,19 @@ def vk_wall_media_sync(
     if not VK_WALL_RE.search(urlsplit(url).path):
         return None
     cookies = _vk_cookie_variants()
+    match = VK_WALL_RE.search(urlsplit(url).path)
+    photos: list[str] = []
+    title = ""
+
+    # Токен надёжнее кук: веб-сессия VK с чужого IP не проходит проверку.
+    if match and VK_TOKEN:
+        try:
+            photos, title = _vk_api_wall_photos(match.group(1), match.group(2))
+            if photos:
+                log.info("VK API: в посте %s фото: %s", url, len(photos))
+        except Exception as exc:  # noqa: BLE001 — куки ещё остаются
+            log.warning("VK API не отдал пост %s: %s", url, exc)
+
     attempts: list[tuple[str, str, str]] = []
     for jar in cookies:
         # Куки из браузера могли быть выданы для vk.ru: пробуем оба зеркала.
@@ -917,9 +998,9 @@ def vk_wall_media_sync(
     if not cookies:
         attempts.append((VK_BROWSER_UA, "", url))
 
-    photos: list[str] = []
-    title = ""
     for user_agent, jar, page_url in attempts:
+        if photos:
+            break
         body = _vk_page(page_url, user_agent, jar)
         if not body:
             continue
@@ -933,7 +1014,6 @@ def vk_wall_media_sync(
         return None
 
     photos = photos[:limit]
-    match = VK_WALL_RE.search(urlsplit(url).path)
     stem = f"vk_{match.group(2)}" if match else "vk"
     headers = {
         "User-Agent": VK_BROWSER_UA,
@@ -1025,6 +1105,7 @@ def vk_diagnose(url: str) -> str:
     lines = [
         "VK-диагностика",
         f"ссылка: {normalized}",
+        f"VK_TOKEN: {'задан' if VK_TOKEN else 'нет'}; "
         f"VK_COOKIE: {'задан' if VK_COOKIE else 'нет'}; "
         f"vk-куки в COOKIES_FILE: {'есть' if file_cookie else 'нет'}",
     ]
@@ -1070,6 +1151,16 @@ def vk_diagnose(url: str) -> str:
     lines.append("попытки:")
     best_photos: list[str] = []
     is_wall = bool(VK_WALL_RE.search(urlsplit(normalized).path))
+    api_match = VK_WALL_RE.search(urlsplit(normalized).path)
+    if VK_TOKEN and api_match:
+        try:
+            api_photos, api_caption = _vk_api_wall_photos(
+                api_match.group(1), api_match.group(2)
+            )
+            note = f" — {api_caption[:60]}" if api_caption else ""
+            lines.append(f"VK API: фото {len(api_photos)}{note}")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"VK API: {str(exc)[:140]}")
     for label, jar, target in attempts:
         user_agent = VK_META_UA if "бот" in label else VK_BROWSER_UA
         result = _vk_fetch(target, user_agent, jar, timeout=20)
@@ -1100,13 +1191,16 @@ def vk_diagnose(url: str) -> str:
 
     if best_photos:
         lines.append(f"итог: можно скачать {len(best_photos)} фото")
-    elif not variants:
-        lines.append("итог: фото нет; для закрытых сообществ нужен VK_COOKIE")
+    elif not variants and not VK_TOKEN:
+        lines.append(
+            "итог: фото нет; для закрытых сообществ нужен VK_TOKEN (надёжнее) "
+            "или VK_COOKIE"
+        )
     else:
         lines.append(
-            "итог: фото нет. Если сессия «НЕ принял куки» — скопируйте Cookie "
-            "из запроса к vk.com целиком; если «принял», но фото 0 — аккаунт "
-            "не видит стену (нет подписки/возраст)."
+            "итог: фото нет. Веб-сессия VK часто не проходит с сервера — "
+            "надёжнее задать VK_TOKEN (vkhost.github.io, права «стена»); "
+            "если куки «приняты», но фото 0 — аккаунт не видит стену."
         )
     return "\n".join(lines)
 
@@ -2722,7 +2816,9 @@ def _search_sync(query: str, provider: str, limit: int) -> list[Track]:
 async def _search_one(query: str, provider: str, limit: int) -> list[Track]:
     try:
         if provider == "hm":
-            return await asyncio.to_thread(_hitmo_search_sync, query, limit)
+            return await asyncio.wait_for(
+                asyncio.to_thread(_hitmo_search_sync, query, limit), timeout=22.0
+            )
         if provider == "zv":
             return await asyncio.wait_for(
                 asyncio.to_thread(_zvyki_search_sync, query, limit), timeout=15.0
@@ -2731,7 +2827,12 @@ async def _search_one(query: str, provider: str, limit: int) -> list[Track]:
             asyncio.to_thread(_search_sync, query, provider, limit), timeout=25.0
         )
     except Exception as exc:  # noqa: BLE001
-        log.warning("%s search failed for %r: %s", provider, query, exc)
+        log.warning(
+            "%s search failed for %r: %s",
+            provider,
+            query,
+            str(exc) or type(exc).__name__,
+        )
         return []
 
 
@@ -2749,6 +2850,53 @@ def _is_hitmo(url: str) -> bool:
     return host.endswith("hitmoz.org") or host.endswith("deliciousoranges.com")
 
 
+def _hitmo_curl_get(
+    url: str,
+    referer: str,
+    timeout: float,
+    on_progress=None,
+    cancel=None,
+    proxy: str | None = None,
+) -> bytes:
+    """Запрос к Hitmo через curl_cffi: TLS-отпечаток Chrome вместо питоновского.
+
+    WAF Hitmo режет по отпечатку рукопожатия, поэтому urllib стабильно
+    получает 403 с датацентра. ``proxy`` — второй шанс с другого IP (WARP).
+    """
+    if _cffi is None:
+        raise DownloadError("curl_cffi недоступен")
+    headers = {**HITMO_HEADERS, "Referer": referer}
+    with _cffi.Session(impersonate="chrome") as session:
+        with session.stream(
+            "GET",
+            url,
+            headers=headers,
+            timeout=timeout,
+            proxy=proxy,
+            allow_redirects=True,
+        ) as response:
+            if response.status_code >= 400:
+                raise urllib.error.HTTPError(
+                    url,
+                    response.status_code,
+                    f"HTTP {response.status_code}",
+                    response.headers,
+                    None,
+                )
+            total = response.headers.get("content-length")
+            total = int(total) if total and total.isdigit() else None
+            chunks: list[bytes] = []
+            done = 0
+            for chunk in response.iter_content(65536):
+                if cancel is not None and cancel.is_set():
+                    raise DownloadCancelled()
+                chunks.append(chunk)
+                done += len(chunk)
+                if on_progress:
+                    on_progress(done, total)
+            return b"".join(chunks)
+
+
 def _hitmo_get(
     url: str,
     opener,
@@ -2762,7 +2910,24 @@ def _hitmo_get(
 
     WAF отвечает 403, если заголовки не похожи на браузерные, и любит
     обрывать SSL — поэтому пробуем несколько раз, обновляя cookie-сессию.
+    Сначала идём через curl_cffi (отпечаток Chrome), при 403 повторяем
+    через FA_PROXY (в контейнере это WARP), и только потом — urllib.
     """
+    if cancel is not None and cancel.is_set():
+        raise DownloadCancelled()
+
+    routes = [None] + ([FA_PROXY] if FA_PROXY else [])
+    for proxy in routes:
+        try:
+            return _hitmo_curl_get(
+                url, referer, timeout, on_progress, cancel, proxy
+            )
+        except DownloadCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 — пробуем следующий маршрут
+            where = "через FA_PROXY" if proxy else "напрямую"
+            log.warning("Hitmo (curl_cffi, %s): %s", where, exc)
+
     last: Exception | None = None
     for attempt in range(attempts):
         if cancel is not None and cancel.is_set():
@@ -2830,7 +2995,7 @@ def _hitmo_search_sync(query: str, limit: int) -> list[Track]:
     """Поиск на ru.hitmoz.org: треки берём из JSON в атрибуте data-musmeta."""
     opener = _hitmo_opener()
     page = f"{HITMO_BASE}/search?{urllib.parse.urlencode({'q': query})}"
-    body = _hitmo_get(page, opener, attempts=2, timeout=12).decode("utf-8", "replace")
+    body = _hitmo_get(page, opener, attempts=1, timeout=12).decode("utf-8", "replace")
 
     tracks: list[Track] = []
     for match in _HITMO_ITEM_RE.finditer(body):
@@ -2956,6 +3121,11 @@ def _zvyki_get(url: str, timeout: float = 30.0) -> str:
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            # 404 — это «такого запроса нет», повтор не поможет
+            if exc.code == 404:
+                raise
+            last = exc
         except Exception as exc:  # noqa: BLE001
             last = exc
     raise last if last else DownloadError("Zvyki недоступен.")
@@ -3005,7 +3175,19 @@ def _zvyki_parse_tracks(body: str, limit: int) -> list[Track]:
 
 def _zvyki_search_sync(query: str, limit: int) -> list[Track]:
     page = f"{ZVYKI_BASE}/search/q/{urllib.parse.quote_plus(query)}/"
-    return _zvyki_parse_tracks(_zvyki_get(page, timeout=20), limit)
+    try:
+        body = _zvyki_get(page, timeout=20)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+        latin = _translit(query)
+        if latin.strip() == query.strip():
+            raise
+        log.info("Zvyki: по-русски 404, ищу «%s»", latin)
+        body = _zvyki_get(
+            f"{ZVYKI_BASE}/search/q/{urllib.parse.quote_plus(latin)}/", timeout=20
+        )
+    return _zvyki_parse_tracks(body, limit)
 
 
 def _zvyki_song_track_sync(url: str) -> Track:
@@ -3821,6 +4003,13 @@ def _rank_tracks(query: str, tracks: list[Track]) -> list[Track]:
     penalize = [hint for hint in _VARIANT_HINTS if hint not in query_low]
     parts = _split_query(query)
 
+    def has_word(word: str, text: str) -> bool:
+        """Слово из запроса или его латиница: Zvyki отдаёт «Serega Pirat»."""
+        if word in text:
+            return True
+        latin = _translit(word)
+        return bool(latin) and latin != word and latin in text
+
     def score(track: Track) -> int:
         artist = (track.uploader or "").lower()
         title = track.title.lower()
@@ -3829,22 +4018,22 @@ def _rank_tracks(query: str, tracks: list[Track]) -> list[Track]:
         def pair(artist_side: str, title_side: str) -> int:
             value = 0
             for word in _query_words(artist_side):
-                if word in artist:
+                if has_word(word, artist):
                     value += 3
-                elif word in title:
+                elif has_word(word, title):
                     value += 1
             for word in _query_words(title_side):
-                if word in title:
+                if has_word(word, title):
                     value += 3
-                elif word in artist:
+                elif has_word(word, artist):
                     value += 1
             return value
 
         if parts:
             value = max(pair(parts[0], parts[1]), pair(parts[1], parts[0]))
         else:
-            value = 3 * sum(1 for word in words if word in artist)
-            value += 2 * sum(1 for word in words if word in title)
+            value = 3 * sum(1 for word in words if has_word(word, artist))
+            value += 2 * sum(1 for word in words if has_word(word, title))
 
         for hint in penalize:
             if hint in text:
@@ -3896,26 +4085,22 @@ async def search(query: str, limit: int = 12, budget: float | None = None) -> li
         await asyncio.wait(set(tasks), timeout=wait_time)
         tracks = _collect_search(tasks)
     else:
-        hm_timeout = 12.0
-        try:
-            tracks = await asyncio.wait_for(
-                _search_one(query_for_search, "hm", min(limit, 30)),
-                timeout=hm_timeout,
-            )
-        except Exception:  # noqa: BLE001 — таймаут или сбой Hitmo
-            tracks = []
+        # Все источники одновременно: раньше Hitmo шёл первым и своими
+        # таймаутами съедал всё время, а SoundCloud/Zvyki отвечают за 2–4 с.
+        tasks = [
+            asyncio.create_task(_search_one(query_for_search, provider, limit))
+            for provider in ("hm", "zv", "sc", "yt")
+        ]
+        await asyncio.wait(set(tasks), timeout=6.0)
+        tracks = _collect_search(tasks)
 
-        # Hitmo редко отдаёт больше десятка треков — добираем Zvyki, SoundCloud
-        # и YouTube, иначе список обрывается на нескольких результатах.
-        if len(tracks) < limit:
-            needed = max(4, limit - len(tracks))
-            tasks = [
-                asyncio.create_task(_search_one(query_for_search, provider, needed))
-                for provider in ("zv", "sc", "yt")
-            ]
-            wait_for_extra = 8.0 if tracks else 20.0
-            await asyncio.wait(set(tasks), timeout=wait_for_extra)
-            tracks.extend(_collect_search(tasks))
+        # Если готовых файлов не набралось, даём отстающим ещё немного
+        # времени. Что не успело — доработает в фоне и никому не помешает.
+        pending = [task for task in tasks if not task.done()]
+        if pending and len(tracks) < min(limit, 4):
+            await asyncio.wait(set(pending), timeout=6.0)
+            tracks.extend(_collect_search(pending))
+        _collect_search([task for task in tasks if not task.done()])
 
     unique: list[Track] = []
     seen: set[str] = set()

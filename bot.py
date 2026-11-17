@@ -12,11 +12,16 @@ from aiogram import Bot, BaseMiddleware, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramUnauthorizedError,
+)
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    ErrorEvent,
     InlineQuery,
     Message,
     Update,
@@ -147,6 +152,17 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.outer_middleware(_UpdateLogger())
     dp.update.outer_middleware(_AccessMiddleware())
+
+    @dp.errors()
+    async def on_error(event: ErrorEvent) -> bool:
+        """Не засоряем логи тем, что и так ожидаемо: старые query_id и прочее."""
+        exc = event.exception
+        if isinstance(exc, TelegramBadRequest) and "query is too old" in str(exc):
+            log.info("апдейт устарел, ответ не нужен: %s", exc)
+            return True
+        log.error("необработанная ошибка: %s", exc, exc_info=exc)
+        return True
+
     dp.include_router(router)
     dp.include_router(inline_router)
 

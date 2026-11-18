@@ -791,7 +791,8 @@ async def cmd_vk_debug(message: Message) -> None:
     except asyncio.TimeoutError:
         report = "Не успел: VK отвечал дольше 150 секунд."
     except Exception as exc:  # noqa: BLE001
-        report = f"{type(exc).__name__}: {exc}"
+        report = f"{type(exc).__name__}: ошибка диагностики"
+        log.warning("vk_debug failed: %s", type(exc).__name__)
     body = f"<pre>{html.escape(report)[:3900]}</pre>"
     try:
         await status.edit_text(body)

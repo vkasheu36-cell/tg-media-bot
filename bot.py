@@ -224,6 +224,12 @@ async def main() -> None:
     )
 
     if PUBLIC_URL:
+        if not WEBHOOK_SECRET:
+            log.warning(
+                "WEBHOOK_SECRET не задан — вебхук принимает запросы без проверки. "
+                "Задайте WEBHOOK_SECRET в Environment, чтобы защитить /webhook "
+                "от поддельных обновлений."
+            )
         await _run_webhook(bot, dp)
     else:
         await _run_polling(bot, dp)

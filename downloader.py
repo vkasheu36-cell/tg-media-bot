@@ -917,14 +917,15 @@ def _vk_api_wall_photos(owner_id: str, post_id: str) -> tuple[list[str], str]:
         with urllib.request.urlopen(request, timeout=20) as response:
             payload = json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        raise DownloadError(f"VK API: HTTP {exc.code}") from exc
+        raise DownloadError(f"VK API: HTTP {exc.code}") from None
+    except Exception as exc:  # noqa: BLE001 — не раскрываем URL с access_token
+        raise DownloadError(f"VK API: {type(exc).__name__}") from None
 
     error = payload.get("error") or {}
     if error:
-        raise DownloadError(
-            "VK API: "
-            + str(error.get("error_msg") or error.get("error_code") or "ошибка")
-        )
+        msg = str(error.get("error_msg") or error.get("error_code") or "ошибка")
+        # error_msg от VK не содержит наш токен/URL, но на всякий случай режем длину
+        raise DownloadError(f"VK API: {msg[:160]}")
     posts = payload.get("response") or []
     if isinstance(posts, dict):
         posts = posts.get("items") or []
@@ -987,7 +988,8 @@ def vk_wall_media_sync(
             if photos:
                 log.info("VK API: в посте %s фото: %s", url, len(photos))
         except Exception as exc:  # noqa: BLE001 — куки ещё остаются
-            log.warning("VK API не отдал пост %s: %s", url, exc)
+            safe = exc if isinstance(exc, DownloadError) else type(exc).__name__
+            log.warning("VK API не отдал пост %s: %s", url, safe)
 
     attempts: list[tuple[str, str, str]] = []
     for jar in cookies:
@@ -1160,7 +1162,8 @@ def vk_diagnose(url: str) -> str:
             note = f" — {api_caption[:60]}" if api_caption else ""
             lines.append(f"VK API: фото {len(api_photos)}{note}")
         except Exception as exc:  # noqa: BLE001
-            lines.append(f"VK API: {str(exc)[:140]}")
+            safe = str(exc) if isinstance(exc, DownloadError) else type(exc).__name__
+            lines.append(f"VK API: {safe[:140]}")
     for label, jar, target in attempts:
         user_agent = VK_META_UA if "бот" in label else VK_BROWSER_UA
         result = _vk_fetch(target, user_agent, jar, timeout=20)

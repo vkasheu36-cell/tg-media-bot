@@ -1421,15 +1421,42 @@ async def cb_x_post(callback: CallbackQuery) -> None:
                 log.exception("X: склейка не удалась")
                 await status.answer(f"❌ Не получилось склеить: {html.escape(str(exc)[:160])}")
                 return
-            sent = await _send_new(
-                status,
-                dest,
-                caption,
-                "Коллаж",
-                post.info.get("uploader") or "",
-                None,
-                settings["send_as_file"],
-            )
+            send_as_file = settings["send_as_file"]
+            if not send_as_file:
+                try:
+                    from PIL import Image
+
+                    with Image.open(dest) as img:
+                        # Telegram photo: сумма сторон и соотношение ограничены
+                        ratio = max(img.width, img.height) / max(min(img.width, img.height), 1)
+                        if img.width + img.height > 10000 or ratio > 20:
+                            send_as_file = True
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                sent = await _send_new(
+                    status,
+                    dest,
+                    caption,
+                    "Коллаж",
+                    post.info.get("uploader") or "",
+                    None,
+                    send_as_file,
+                )
+            except Exception:
+                if not send_as_file:
+                    log.warning("X: отправка коллажа фото не удалась, пробую файлом", exc_info=True)
+                    sent = await _send_new(
+                        status,
+                        dest,
+                        caption,
+                        "Коллаж",
+                        post.info.get("uploader") or "",
+                        None,
+                        True,
+                    )
+                else:
+                    raise
             _remember(sent, f"{storage.normalize_url(post.url)}#collage", "Коллаж")
         else:
             if action == "all" and images:

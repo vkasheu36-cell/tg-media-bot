@@ -4626,6 +4626,29 @@ except Exception:  # noqa: BLE001
     _cffi = None
 
 _FA_SESSION = None
+# Chrome-отпечаток и куки уже проверены /fa_debug — запоминаем найденную
+# картинку, чтобы повтор не упирался в Cloudflare на странице работы.
+_FA_RESOLVED: dict[str, tuple[float, str, str, str]] = {}
+_FA_CACHE_TTL = 1800.0  # полчаса: ссылка на файл FA живет недолго
+
+
+def _fa_cache_key(sub_id: str) -> str:
+    return str(sub_id)
+
+
+def _fa_cache_get(sub_id: str) -> tuple[str, str, str] | None:
+    item = _FA_RESOLVED.get(_fa_cache_key(sub_id))
+    if not item or time.monotonic() - item[0] > _FA_CACHE_TTL:
+        _FA_RESOLVED.pop(_fa_cache_key(sub_id), None)
+        return None
+    return item[1], item[2], item[3]
+
+
+def _fa_cache_put(sub_id: str, image: str, title: str, author: str) -> None:
+    if image:
+        _FA_RESOLVED[_fa_cache_key(sub_id)] = (
+            time.monotonic(), image, title, author
+        )
 
 
 def _is_fa(url: str) -> bool:
@@ -5218,7 +5241,11 @@ def _fa_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, 
                 "Пришлите ссылку вида www.furaffinity.net/view/12345678/"
             )
         sub_id = match.group(1)
-        found = _fa_fetch_page(sub_id)
+        found = _fa_cache_get(sub_id)
+        if found:
+            log.info("FurAffinity: картинка из кэша (/fa_debug) для %s", sub_id)
+        else:
+            found = _fa_fetch_page(sub_id)
         login_note = ""
         if not (found and found[0]) and _FA_STATE["logged"]:
             # думали, что сессия живая, а картинки нет — возможно, она протухла
@@ -5234,6 +5261,8 @@ def _fa_from_url_sync(url: str, out_dir: Path, on_progress=None) -> tuple[Path, 
         if not found:
             raise DownloadError(FA_BLOCKED)
         image, title, author = found
+        if image:
+            _fa_cache_put(sub_id, image, title, author)
         if not image:
             if _FA_STATE["logged"]:
                 message = (
@@ -5486,6 +5515,9 @@ def _fa_diagnose_sync(url: str) -> str:
                 f"{'картинка' if _fa_image_ok(data) else 'НЕ картинка (HTML Cloudflare)'}"
             )
 
+    if final_image:
+        title, author = _fa_title_author(body)
+        _fa_cache_put(sub_id, final_image, title, author)
     lines.append("Итог: картинка " + ("найдена" if final_image else "не найдена"))
     return "\n".join(lines)
 
